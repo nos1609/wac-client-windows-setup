@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "ru-RU"
+early_access: false
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  review_details: false
+  poem: false
+  path_filters:
+    - "!dist/**"
+    - "!tmp/**"
+    - "!.codex/**"
+    - "!.tools/**"
+    - "!local/**"
+  path_instructions:
+    - path: "**/*.ps1"
+      instructions: "Проверяй совместимость с Windows PowerShell 5.1, безопасную передачу аргументов массивами, корректную работу с UTF-8 и отсутствие случайного включения Microsoft WAC payload."
+    - path: "**/*.md"
+      instructions: "Основная документация на русском, английские версии лежат рядом как .en.md. Для языковых cross-links подпись пишется на языке документа, куда ведет ссылка."
+    - path: ".github/workflows/**"
+      instructions: "Проверяй, что CI собирает тот же release package через scripts/build-dist.ps1 и не публикует локальные временные артефакты."
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
+chat:
+  auto_reply: true
+knowledge_base:
+  pull_requests:
+    scope: "local"
+  mcp:
+    usage: "disabled"

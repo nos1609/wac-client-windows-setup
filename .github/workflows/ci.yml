@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and build release package
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Pester 4
+        run: Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run release checks
+        run: |
+          Import-Module Pester -RequiredVersion 4.10.1 -Force
+          .\scripts\test-release.ps1
+
+      - name: Build release package
+        run: .\scripts\build-dist.ps1
+
+      - name: Verify release package hash
+        run: |
+          $hashLine = Get-Content -LiteralPath .\dist\wac-client-windows-setup.zip.sha256 -Raw
+          $expectedHash = ($hashLine -split '\s+')[0]
+          $actualHash = (Get-FileHash -LiteralPath .\dist\wac-client-windows-setup.zip -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) {
+            throw "SHA256 mismatch. Expected $expectedHash, got $actualHash."
+          }
+
+      - name: Upload release package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wac-client-windows-setup
+          path: |
+            dist/wac-client-windows-setup.zip
+            dist/wac-client-windows-setup.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
