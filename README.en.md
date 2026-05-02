@@ -76,6 +76,8 @@ https://localhost:6600
 
 The generated self-signed certificate is valid for 60 days. The browser will show a certificate warning unless you provide a trusted certificate or trust the generated one.
 
+If WAC must open both as `https://localhost:6600` and through an external DNS alias, for example behind a router reverse proxy, set that name as `Endpoint FQDN`. A generated self-signed certificate includes the endpoint FQDN, the internal service FQDN, the computer name, and `localhost`, so local access through `localhost` remains usable.
+
 ## TUI Installer
 
 `install-wac.cmd` opens the interactive terminal wizard by default. The wizard uses only built-in PowerShell features, shows a short ready-to-install summary, and keeps the full low-level plan behind a separate `Details` action.
@@ -142,11 +144,11 @@ On the `Custom setup` screen, every row is selectable with the arrow keys. `Ente
 | `Gateway HTTPS port` | Port used by the WAC web UI. | Configures `appsettings.json`, HTTP.SYS SSL binding, URL ACL, and firewall rule. Default: `6600`. |
 | `Service port range start` | First internal WAC service port. | Written to WAC configuration. Default: `6601`. |
 | `Service port range end` | Last internal WAC service port. | Written to WAC configuration. The range must not be reversed and should follow the gateway port. Default: `6610`. |
-| `Endpoint FQDN` | Name users use to open WAC. | Written to gateway settings. Defaults to the computer name. |
-| `Internal service FQDN` | Name used for internal WAC service calls. | Written to service settings. Usually keep `localhost`. |
+| `Endpoint FQDN` | Name users use to open WAC. | Written to gateway settings. If WAC is opened through a DNS alias and a reverse proxy, set the external CNAME here. Defaults to the computer name. |
+| `Internal service FQDN` | Name used for internal WAC service calls. | Written to service settings. Usually keep `localhost`. If you use another name, the TLS certificate must cover it too. |
 | `TLS certificate mode` | Use an existing certificate or create a self-signed one. | If a thumbprint is set, uses a certificate from `LocalMachine\My`; otherwise creates a self-signed certificate. |
-| `Certificate thumbprint` | Thumbprint of an existing TLS certificate. | Looked up in `LocalMachine\My`. The certificate must be valid for Server Authentication and have an accessible private key. |
-| `Generated certificate subject` | Subject for a new self-signed certificate. | Used only when no thumbprint is provided. Default: `WindowsAdminCenterSelfSigned`. |
+| `Certificate thumbprint` | Thumbprint of an existing TLS certificate. | Looked up in `LocalMachine\My`. The certificate must be valid for Server Authentication, have an accessible private key, and cover all WAC names, including `Endpoint FQDN`, `Internal service FQDN`, the computer name, and `localhost`. |
+| `Generated certificate subject` | Subject for a new self-signed certificate. | Used only when no thumbprint is provided. The normal TUI value is not passed as an explicit parameter. If WinRM over HTTPS is enabled, CN is taken from `Endpoint FQDN`; SAN also includes `Internal service FQDN`, the computer name, and `localhost`. If a custom `-CertificateSubject` is passed manually, it must match `-EndpointFqdn`; the installer adds the other names to SAN. |
 | `Automatic updates` | Stock wizard update-mode field. | Stored as the selected configuration value for setup; this package does not provide an update service. |
 | `Trust generated self-signed certificate` | Add the generated certificate to trusted roots. | Yellow option. Applies only to a generated/reused self-signed certificate; adds it to `LocalMachine\Root` to reduce browser warnings and internal .NET TLS failures. Uninstall does not remove this certificate from `LocalMachine\My` or `LocalMachine\Root`; remove it manually by thumbprint if you no longer need it. |
 | `Enable PowerShell Remoting` | Enable WinRM/PowerShell Remoting. | Yellow option. Enabled by default because WAC uses WinRM even for local management. If disabled, the installer passes `-SkipPsRemoting`, and some WAC flows may not work. |
@@ -155,6 +157,8 @@ On the `Custom setup` screen, every row is selectable with the arrow keys. `Ente
 | `Network access` | Inbound access scope for the WAC web UI. | `local only` removes/skips WAC inbound firewall rules; `local subnet` creates rules with `RemoteAddress=LocalSubnet`; `any address` opens rules for `Any`. HTTP.SYS is still reserved for the selected WAC port. |
 | `TrustedHosts mode` | Allow WAC to manage WinRM `TrustedHosts` for workgroup/local-account scenarios. | Yellow option. `manage automatically (*)` sets `WSMan:\localhost\Client\TrustedHosts` to `*` unless policy owns the setting. This means the WinRM client can trust any remote host for workgroup/NTLM-style connections; it does not open the WAC web UI to everyone, but it is still a sensitive machine setting. The setup stores the previous value in the marker and uninstall restores it only when the current value is still `*`. `do not change` leaves the current value untouched. |
 | `WinRM over HTTPS` | Use HTTPS for WAC WinRM connections. | Yellow option. Writes `WindowsAdminCenter.FeatureParameters.Base.WinRmOverHttps=true`, creates a WinRM HTTPS listener on `5986` with the WAC TLS certificate, and opens a firewall rule for `5986`. The disabled value does not remove existing WinRM listeners. |
+
+For a router reverse-proxy setup, usually set `Endpoint FQDN` to the external CNAME and keep `Internal service FQDN` as `localhost`. The external proxy sends user traffic to WAC, while WAC itself and local checks keep using `localhost`. If `WinRM over HTTPS` is enabled, the WinRM listener hostname must match the certificate CN or SAN; for that mode, the automatically generated certificate uses the external FQDN as CN and also includes `Internal service FQDN`, the computer name, and `localhost`. An old generated certificate is reused only when it already covers the required names and is valid for Server Authentication; otherwise the installer creates a new certificate.
 
 Command-line mapping:
 
@@ -222,14 +226,14 @@ The script performs these machine-level actions:
 - removes the old WAC HTTP.SYS binding on port `6600`;
 - copies WAC files to `C:\Program Files\WindowsAdminCenter`;
 - copies WAC data to `C:\ProgramData\WindowsAdminCenter`;
-- creates or reuses a `WindowsAdminCenterSelfSigned` certificate;
+- creates or reuses a TLS certificate for the selected WAC names;
 - grants `NETWORK SERVICE` access to the certificate private key;
 - configures `appsettings.json` for ports `6600-6610`;
 - registers HTTP.SYS SSL and URL ACL;
 - creates or removes Windows Firewall inbound rules according to `-NetworkAccess`;
 - enables WinRM/PowerShell Remoting unless `-SkipPsRemoting` is specified;
 - optionally changes WinRM `TrustedHosts`;
-- optionally enables WinRM over HTTPS and opens port `5986`;
+- optionally enables WinRM over HTTPS and opens port `5986`; for a generated certificate, accounts for the endpoint FQDN, the internal service FQDN, the computer name, and `localhost`;
 - verifies the WAC installer Authenticode signature before extraction: the
   signature must be valid and the publisher must be `O=Microsoft Corporation`;
 - runs `efbundle.exe` to initialize the WAC database;
@@ -304,6 +308,18 @@ Known ARM64 limitations:
 - Overview and Network pages can show an error such as `Network performance class was not found`. On a Russian Windows installation the counter exists as `Сетевой интерфейс`, while parts of WAC extensions can request the English `Network Interface` name. This is a WAC/localization limitation, not evidence that system performance counters are broken.
 - WAC uses WinRM/PowerShell remoting heavily even for the local computer. A local account without a normal password, a Microsoft account alias, and Windows Hello/PIN can produce unstable `New-PSSession`/`WSMan` errors. For sign-in and Manage as, prefer explicit `COMPUTERNAME\user` syntax and the password Windows accepts for that account.
 
+## Credentials for Managed Nodes
+
+Signing in to the WAC web UI and connecting to a selected managed node are separate checks. The account that can open the web UI may still lack rights to manage the computer. To connect through WAC, the account must be an administrator on the target machine.
+
+For a local account, use an explicit name:
+
+```text
+COMPUTERNAME\user
+```
+
+The short `user` name may work for the web UI sign-in and still fail when WAC connects to the node through WinRM. The `Use my Windows account for this connection` option depends on pass-through authentication and Kerberos delegation; in standalone/workgroup scenarios without domain configuration, choose `use another account` and enter a target-machine administrator explicitly.
+
 ## Why Not Winget Install
 
 `winget install --id Microsoft.WindowsAdminCenter` runs the stock Windows Admin Center installer. On the locally tested Windows 11 x64 26H1 system, that path can hit the WAC preflight that checks for server SKUs.
@@ -329,16 +345,16 @@ If WAC services are running and port `6600` is listening, but the browser or `cu
 In that case, the clean repair path is to rotate WAC to a new certificate instead of reusing the old key binding:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData -TrustSelfSignedCertificate -CertificateSubject "WindowsAdminCenterSelfSignedRepair"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData -TrustSelfSignedCertificate
 ```
 
 On ARM64:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -SkipArchitectureCheck -KeepExistingData -TrustSelfSignedCertificate -CertificateSubject "WindowsAdminCenterSelfSignedRepair"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -SkipArchitectureCheck -KeepExistingData -TrustSelfSignedCertificate
 ```
 
-These commands preserve `C:\ProgramData\WindowsAdminCenter` and pass a new `-CertificateSubject`, so the script does not reuse the old certificate.
+These commands preserve `C:\ProgramData\WindowsAdminCenter` and create or reuse a certificate for the current `Endpoint FQDN`. If WAC must open through an external CNAME, pass it explicitly with `-EndpointFqdn`; with WinRM over HTTPS enabled, that FQDN becomes the CN of the generated certificate, while `Internal service FQDN` and `localhost` remain in SAN. If the machine already has an old generated WAC certificate with unsuitable names, it is not reused.
 The repair flow also adds the generated self-signed certificate to `LocalMachine\Root`, because some internal WAC/.NET TLS calls can still reject an untrusted chain even when the gateway itself is running. This trust anchor remains in the store after WAC uninstall until you remove the certificate manually.
 
 

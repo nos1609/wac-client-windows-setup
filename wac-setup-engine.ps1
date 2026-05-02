@@ -49,10 +49,23 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+function Get-NativeProcessOutputEncoding {
+  try {
+    $oemCodePage = [Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+    if ($oemCodePage -gt 0) {
+      return [System.Text.Encoding]::GetEncoding($oemCodePage)
+    }
+  } catch {
+  }
+
+  return [Console]::OutputEncoding
+}
+
 $script:OriginalBoundParameters = @{}
 foreach ($key in $PSBoundParameters.Keys) {
   $script:OriginalBoundParameters[$key] = $PSBoundParameters[$key]
 }
+$script:NativeProcessOutputEncoding = Get-NativeProcessOutputEncoding
 try {
   [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
   $OutputEncoding = [Console]::OutputEncoding
@@ -301,30 +314,23 @@ function Invoke-LoggedProcess {
     [Parameter(Mandatory = $true)][string]$FilePath,
     [string[]]$ArgumentList = @(),
     [string]$WorkingDirectory = "",
-    [int]$TimeoutSeconds = 0
+    [int]$TimeoutSeconds = 0,
+    [bool]$LogOutputOnSuccess = $true
   )
 
   Write-Log ("RUN: {0} {1}" -f $FilePath, ($ArgumentList -join " "))
   $previousLocation = Get-Location
   try {
-    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
-      Set-Location -LiteralPath $WorkingDirectory
-    }
-
-    if ($TimeoutSeconds -le 0) {
-      $output = & $FilePath @ArgumentList 2>&1
-      $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
-      $text = $output | Out-String -Width 4096
-      if ($text) { Add-LogContent -Value $text }
-      Write-Log ("EXIT {0}: {1}" -f $FilePath, $exitCode)
-      return [pscustomobject]@{ ExitCode = $exitCode; StdOut = $text; StdErr = ""; TimedOut = $false }
-    }
-
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = $script:NativeProcessOutputEncoding
+    $psi.StandardErrorEncoding = $script:NativeProcessOutputEncoding
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+      $psi.WorkingDirectory = $WorkingDirectory
+    }
     $psi.Arguments = (($ArgumentList | ForEach-Object {
       if ($_ -match '[\s"]') {
         '"' + ($_ -replace '"', '\"') + '"'
@@ -334,16 +340,25 @@ function Invoke-LoggedProcess {
     }) -join " ")
 
     $process = [System.Diagnostics.Process]::Start($psi)
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $completed = if ($TimeoutSeconds -gt 0) {
+      $process.WaitForExit($TimeoutSeconds * 1000)
+    } else {
+      $process.WaitForExit()
+      $true
+    }
+
+    if (-not $completed) {
       try { $process.Kill() } catch {}
       Write-Log ("TIMEOUT {0}: exceeded {1} seconds" -f $FilePath, $TimeoutSeconds) "WARN"
       return [pscustomobject]@{ ExitCode = -1; StdOut = ""; StdErr = "Timed out after $TimeoutSeconds seconds."; TimedOut = $true }
     }
 
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
-    if ($stdout) { Add-LogContent -Value $stdout }
-    if ($stderr) { Add-LogContent -Value $stderr }
+    $stdout = $stdoutTask.Result
+    $stderr = $stderrTask.Result
+    if ($stdout -and ($LogOutputOnSuccess -or $process.ExitCode -ne 0)) { Add-LogContent -Value $stdout }
+    if ($stderr -and ($LogOutputOnSuccess -or $process.ExitCode -ne 0)) { Add-LogContent -Value $stderr }
     Write-Log ("EXIT {0}: {1}" -f $FilePath, $process.ExitCode)
     return [pscustomobject]@{ ExitCode = $process.ExitCode; StdOut = $stdout; StdErr = $stderr; TimedOut = $false }
   } finally {
@@ -371,6 +386,14 @@ function Get-InstallerDownloadDirectory {
 function Find-WacInstallerInDirectory {
   param([Parameter(Mandatory = $true)][string]$Path)
 
+  $installer = Find-WacInstallersInDirectory -Path $Path | Select-Object -First 1
+  if ($installer) { return $installer }
+  return ""
+}
+
+function Find-WacInstallersInDirectory {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
   if (-not (Test-Path -LiteralPath $Path)) { return "" }
 
   $candidates = Get-ChildItem -LiteralPath $Path -Recurse -File -Filter "*.exe" -ErrorAction SilentlyContinue |
@@ -380,8 +403,43 @@ function Find-WacInstallerInDirectory {
     } |
     Sort-Object LastWriteTime -Descending
 
-  $installer = $candidates | Select-Object -First 1
-  if ($installer) { return $installer.FullName }
+  return @($candidates | ForEach-Object { $_.FullName })
+}
+
+function Test-WacInstallerAuthenticode {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  try {
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+  } catch {
+    Write-Log "Ignoring cached Windows Admin Center installer that could not be validated: $Path" "WARN"
+    return $false
+  }
+
+  if ($sig.Status -ne "Valid") {
+    Write-Log "Ignoring cached Windows Admin Center installer with invalid signature: $Path ($($sig.Status))" "WARN"
+    return $false
+  }
+  if ($null -eq $sig.SignerCertificate -or $sig.SignerCertificate.Subject -notmatch "(^|,\s*)O=Microsoft Corporation(,|$)") {
+    Write-Log "Ignoring cached Windows Admin Center installer with unexpected signer: $Path" "WARN"
+    return $false
+  }
+
+  return $true
+}
+
+function Get-CachedWacInstaller {
+  $downloadDir = Get-InstallerDownloadDirectory
+  $candidates = Find-WacInstallersInDirectory -Path $downloadDir
+
+  foreach ($installer in @($candidates)) {
+    if ([string]::IsNullOrWhiteSpace($installer)) { continue }
+    if (Test-WacInstallerAuthenticode -Path $installer) {
+      Write-Log "Using cached Windows Admin Center installer: $installer"
+      return $installer
+    }
+  }
+
   return ""
 }
 
@@ -408,9 +466,14 @@ function Save-WacInstallerFromWinget {
     "--disable-interactivity"
   )
 
-  $result = Invoke-LoggedProcess -FilePath $winget.Source -ArgumentList $arguments -TimeoutSeconds $script:WingetDownloadTimeoutSeconds
+  $result = Invoke-LoggedProcess -FilePath $winget.Source -ArgumentList $arguments -TimeoutSeconds $script:WingetDownloadTimeoutSeconds -LogOutputOnSuccess:$false
   if ($result.ExitCode -ne 0) {
-    Write-Log "winget download failed with exit code $($result.ExitCode); falling back to aka.ms" "WARN"
+    Write-Log "winget download failed with exit code $($result.ExitCode); falling back to cached installer or aka.ms" "WARN"
+    $cachedInstaller = Get-CachedWacInstaller
+    if (-not [string]::IsNullOrWhiteSpace($cachedInstaller)) {
+      Write-Log "Using cached Windows Admin Center installer after winget failure"
+      return $cachedInstaller
+    }
     return ""
   }
 
@@ -628,7 +691,7 @@ function Stop-And-DeleteService {
     Write-Log "Stopping service $Name"
     Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
-    [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("delete", $Name))
+  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("delete", $Name) -LogOutputOnSuccess:$false)
     Start-Sleep -Seconds 2
   }
 }
@@ -652,8 +715,8 @@ function Wait-WacServiceRunning {
 function Remove-HttpSysBinding {
   param([int]$BindingPort)
 
-  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "delete", "sslcert", "ipport=0.0.0.0:$BindingPort"))
-  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "delete", "urlacl", "url=https://+:$BindingPort/"))
+  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "delete", "sslcert", "ipport=0.0.0.0:$BindingPort") -LogOutputOnSuccess:$false)
+  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "delete", "urlacl", "url=https://+:$BindingPort/") -LogOutputOnSuccess:$false)
 }
 
 function Grant-DirectoryAcl {
@@ -670,19 +733,214 @@ function Grant-DirectoryAcl {
     "/T",
     "/C"
   )
-  [void](Invoke-LoggedProcess -FilePath "icacls.exe" -ArgumentList $args)
+  [void](Invoke-LoggedProcess -FilePath "icacls.exe" -ArgumentList $args -LogOutputOnSuccess:$false)
+}
+
+function Get-EffectiveCertificateSubject {
+  if ($WinRmHttpsMode -eq "Enable" -and -not [string]::IsNullOrWhiteSpace($EndpointFqdn)) {
+    if ($script:OriginalBoundParameters.ContainsKey("CertificateSubject") -and -not (Test-IsDefaultCertificateSubject -Subject $CertificateSubject)) {
+      $subjectName = Get-CertificateSubjectCommonName -Subject $CertificateSubject
+      if (-not (Test-CertificateDnsName -Pattern $subjectName -Name $EndpointFqdn)) {
+        throw "CertificateSubject must match EndpointFqdn when WinRM over HTTPS is enabled. Omit -CertificateSubject or set it to $EndpointFqdn."
+      }
+    }
+    return $EndpointFqdn
+  }
+
+  return $CertificateSubject
+}
+
+function Get-CertificateSubjectCommonName {
+  param([AllowNull()][string]$Subject = "")
+
+  $value = if ($null -eq $Subject) { "" } else { $Subject.Trim() }
+  $match = [regex]::Match($value, "^\s*CN\s*=\s*([^,]+)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+  if ($match.Success) {
+    return $match.Groups[1].Value.Trim()
+  }
+  return $value
+}
+
+function Test-IsDefaultCertificateSubject {
+  param([AllowNull()][string]$Subject = "")
+
+  return [string]::Equals(
+    (Get-CertificateSubjectCommonName -Subject $Subject),
+    "WindowsAdminCenterSelfSigned",
+    [System.StringComparison]::OrdinalIgnoreCase
+  )
+}
+
+function Get-RequiredGeneratedCertificateDnsNames {
+  $serviceHostname = if ([string]::IsNullOrWhiteSpace($ServiceFqdn)) { "localhost" } else { $ServiceFqdn }
+  $names = @($EndpointFqdn, $env:COMPUTERNAME, $serviceHostname, "localhost") |
+    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+    ForEach-Object { ([string]$_).Trim() } |
+    Sort-Object -Unique
+  return @($names)
+}
+
+function Get-CertificateDnsNames {
+  param([Parameter(Mandatory = $true)]$Certificate)
+
+  $names = New-Object System.Collections.Generic.List[string]
+  if ($Certificate.PSObject.Properties.Name -contains "DnsNameList") {
+    foreach ($name in @($Certificate.DnsNameList)) {
+      if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
+        [void]$names.Add(([string]$name).Trim())
+      }
+    }
+  }
+
+  if ($Certificate.Subject -match "(^|,\s*)CN=([^,]+)") {
+    [void]$names.Add($matches[2].Trim())
+  }
+
+  return @($names | Sort-Object -Unique)
+}
+
+function Test-CertificateDnsName {
+  param(
+    [Parameter(Mandatory = $true)][string]$Pattern,
+    [Parameter(Mandatory = $true)][string]$Name
+  )
+
+  $patternValue = $Pattern.Trim().ToLowerInvariant()
+  $nameValue = $Name.Trim().ToLowerInvariant()
+  if ($patternValue -eq $nameValue) { return $true }
+
+  if ($patternValue.StartsWith("*.")) {
+    $suffix = $patternValue.Substring(1)
+    if ($nameValue.EndsWith($suffix) -and (($nameValue.Length - $suffix.Length) -gt 0)) {
+      $prefix = $nameValue.Substring(0, $nameValue.Length - $suffix.Length)
+      return ($prefix -notmatch "\.")
+    }
+  }
+
+  return $false
+}
+
+function Test-CertificateHasUsablePrivateKey {
+  param([Parameter(Mandatory = $true)]$Certificate)
+
+  if (-not $Certificate.HasPrivateKey) { return $false }
+
+  $rsa = $null
+  try {
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Certificate)
+    if ($rsa) { return $true }
+  } catch {
+  } finally {
+    if ($rsa) { $rsa.Dispose() }
+  }
+
+  $ecdsa = $null
+  try {
+    $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($Certificate)
+    return ($null -ne $ecdsa)
+  } catch {
+    return $false
+  } finally {
+    if ($ecdsa) { $ecdsa.Dispose() }
+  }
+}
+
+function Test-CertificateHasServerAuthentication {
+  param([Parameter(Mandatory = $true)]$Certificate)
+
+  if (-not ($Certificate.PSObject.Properties.Name -contains "EnhancedKeyUsageList")) {
+    return $false
+  }
+
+  foreach ($usage in @($Certificate.EnhancedKeyUsageList)) {
+    $oidValue = if ($usage.PSObject.Properties.Name -contains "ObjectId") { [string]$usage.ObjectId } else { "" }
+    $friendlyName = if ($usage.PSObject.Properties.Name -contains "FriendlyName") { [string]$usage.FriendlyName } else { "" }
+    if ($oidValue -eq "1.3.6.1.5.5.7.3.1" -or $friendlyName -eq "Server Authentication") {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Test-CertificateUsableForWac {
+  param(
+    [Parameter(Mandatory = $true)]$Certificate,
+    [Parameter(Mandatory = $true)][string[]]$RequiredDnsNames
+  )
+
+  if (-not $Certificate.HasPrivateKey) { return $false }
+  if (-not (Test-CertificateHasServerAuthentication -Certificate $Certificate)) { return $false }
+
+  $certNames = @(Get-CertificateDnsNames -Certificate $Certificate)
+  foreach ($requiredName in $RequiredDnsNames) {
+    $matched = $false
+    foreach ($certName in $certNames) {
+      if (Test-CertificateDnsName -Pattern $certName -Name $requiredName) {
+        $matched = $true
+        break
+      }
+    }
+    if (-not $matched) { return $false }
+  }
+
+  return $true
+}
+
+function Test-ReusableGeneratedCertificate {
+  param([Parameter(Mandatory = $true)]$Certificate)
+
+  return (
+    $Certificate.Issuer -eq $Certificate.Subject -and
+    $Certificate.FriendlyName -eq "Windows Admin Center Self-Signed Certificate" -and
+    (Test-CertificateHasServerAuthentication -Certificate $Certificate) -and
+    (Test-CertificateHasUsablePrivateKey -Certificate $Certificate)
+  )
+}
+
+function Assert-SuppliedCertificateUsableForWac {
+  param([Parameter(Mandatory = $true)]$Certificate)
+
+  if (-not (Test-CertificateHasUsablePrivateKey -Certificate $Certificate)) {
+    throw "Supplied certificate $($Certificate.Thumbprint) does not have an accessible private key."
+  }
+  if (-not (Test-CertificateHasServerAuthentication -Certificate $Certificate)) {
+    throw "Supplied certificate $($Certificate.Thumbprint) is not valid for Server Authentication."
+  }
+  $gatewayHostname = if ([string]::IsNullOrWhiteSpace($EndpointFqdn)) { $env:COMPUTERNAME } else { $EndpointFqdn }
+  $serviceHostname = if ([string]::IsNullOrWhiteSpace($ServiceFqdn)) { "localhost" } else { $ServiceFqdn }
+  $requiredNames = @($gatewayHostname, $serviceHostname) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+    Sort-Object -Unique
+  if (-not (Test-CertificateUsableForWac -Certificate $Certificate -RequiredDnsNames $requiredNames)) {
+    throw "Supplied certificate $($Certificate.Thumbprint) does not cover required WAC names: $($requiredNames -join ', ')."
+  }
+}
+
+function Write-CertificateDiagnostics {
+  param([Parameter(Mandatory = $true)]$Certificate)
+
+  $dnsNames = @(Get-CertificateDnsNames -Certificate $Certificate) -join ", "
+  if ([string]::IsNullOrWhiteSpace($dnsNames)) { $dnsNames = "<none>" }
+  Write-Log "Certificate selected: Thumbprint=$($Certificate.Thumbprint) Subject=$($Certificate.Subject)"
+  Write-Log "Certificate DNS names: $dnsNames"
 }
 
 function Get-OrCreateCertificate {
   if (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
     $cert = Get-Item -LiteralPath ("Cert:\LocalMachine\My\{0}" -f $CertificateThumbprint) -ErrorAction Stop
+    Assert-SuppliedCertificateUsableForWac -Certificate $cert
     Write-Log "Using supplied certificate thumbprint $($cert.Thumbprint)"
     return $cert
   }
 
-  $subject = if ($CertificateSubject.StartsWith("CN=")) { $CertificateSubject } else { "CN=$CertificateSubject" }
+  $effectiveSubject = Get-EffectiveCertificateSubject
+  $subject = if ($effectiveSubject.StartsWith("CN=")) { $effectiveSubject } else { "CN=$effectiveSubject" }
+  $requiredNames = Get-RequiredGeneratedCertificateDnsNames
   $cert = Get-ChildItem Cert:\LocalMachine\My\* -ErrorAction SilentlyContinue |
     Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date).AddDays(7) } |
+    Where-Object { Test-ReusableGeneratedCertificate -Certificate $_ } |
+    Where-Object { Test-CertificateUsableForWac -Certificate $_ -RequiredDnsNames $requiredNames } |
     Sort-Object NotAfter -Descending |
     Select-Object -First 1
 
@@ -691,13 +949,21 @@ function Get-OrCreateCertificate {
     return $cert
   }
 
+  $staleCert = Get-ChildItem Cert:\LocalMachine\My\* -ErrorAction SilentlyContinue |
+    Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date).AddDays(7) } |
+    Where-Object { Test-ReusableGeneratedCertificate -Certificate $_ } |
+    Select-Object -First 1
+  if ($staleCert) {
+    Write-Log "Existing certificate $($staleCert.Thumbprint) does not cover required WAC names; creating a new one" "WARN"
+  }
+
   Write-Log "Creating self-signed certificate for $EndpointFqdn"
-  $newCertSubject = if ($CertificateSubject.StartsWith("CN=")) { $CertificateSubject } else { "CN=$CertificateSubject" }
+  $newCertSubject = if ($effectiveSubject.StartsWith("CN=")) { $effectiveSubject } else { "CN=$effectiveSubject" }
   $keySecurity = New-Object System.Security.AccessControl.FileSecurity
   $keySecurity.SetSecurityDescriptorSddlForm("O:SYG:SYD:AI(A;;GAGR;;;SY)(A;;GAGR;;;NS)(A;;GAGR;;;BA)(A;;GR;;;BU)")
   $certArgs = @{
     Subject           = $newCertSubject
-    DnsName           = @($EndpointFqdn, $env:COMPUTERNAME, "localhost") | Sort-Object -Unique
+    DnsName           = $requiredNames
     FriendlyName      = "Windows Admin Center Self-Signed Certificate"
     KeyAlgorithm      = "RSA"
     KeyLength         = 2048
@@ -790,7 +1056,7 @@ function Grant-CertificatePrivateKeyAcl {
   } catch {}
 
   try {
-    $certutil = Invoke-LoggedProcess -FilePath "certutil.exe" -ArgumentList @("-store", "My", $Certificate.Thumbprint)
+    $certutil = Invoke-LoggedProcess -FilePath "certutil.exe" -ArgumentList @("-store", "My", $Certificate.Thumbprint) -LogOutputOnSuccess:$false
     foreach ($line in ($certutil.StdOut -split "`r?`n")) {
       if ($line -match "(?:Unique container name|Уникальное имя контейнера)\s*:\s*(.+)$") {
         Add-PrivateKeyPathCandidate -Name $matches[1]
@@ -806,7 +1072,7 @@ function Grant-CertificatePrivateKeyAcl {
 
   foreach ($path in ($paths | Select-Object -Unique)) {
     if (Test-Path -LiteralPath $path) {
-      [void](Invoke-LoggedProcess -FilePath "icacls.exe" -ArgumentList @($path, "/grant", "*S-1-5-20:R"))
+      [void](Invoke-LoggedProcess -FilePath "icacls.exe" -ArgumentList @($path, "/grant", "*S-1-5-20:R") -LogOutputOnSuccess:$false)
       $foundCandidates++
     }
   }
@@ -866,8 +1132,8 @@ function Register-HttpSys {
 
   Write-Log "Registering HTTP.SYS for port $Port"
   Remove-HttpSysBinding -BindingPort $Port
-  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "add", "sslcert", "ipport=0.0.0.0:$Port", "certhash=$($Certificate.Thumbprint)", "appid=$script:AppId"))
-  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "add", "urlacl", "url=https://+:$Port/", "sddl=D:(A;;GX;;;NS)"))
+  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "add", "sslcert", "ipport=0.0.0.0:$Port", "certhash=$($Certificate.Thumbprint)", "appid=$script:AppId") -LogOutputOnSuccess:$false)
+  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "add", "urlacl", "url=https://+:$Port/", "sddl=D:(A;;GX;;;NS)") -LogOutputOnSuccess:$false)
 }
 
 function Register-Firewall {
@@ -934,6 +1200,16 @@ function Restore-WinRmTrustedHosts {
   Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value $PreviousValue -Force
 }
 
+function Get-WinRmCommandPath {
+  $command = Get-Command "winrm.cmd" -ErrorAction SilentlyContinue
+  if ($command) { return $command.Source }
+
+  $command = Get-Command "winrm" -ErrorAction SilentlyContinue
+  if ($command) { return $command.Source }
+
+  throw "WinRM command-line tool was not found. Expected winrm.cmd in the Windows system directory."
+}
+
 function Set-WinRmHttpsMode {
   param([Parameter(Mandatory = $true)]$Certificate)
 
@@ -945,8 +1221,9 @@ function Set-WinRmHttpsMode {
   Write-Log "Configuring WinRM HTTPS listener on port 5986"
   $hostname = if ([string]::IsNullOrWhiteSpace($EndpointFqdn)) { $env:COMPUTERNAME } else { $EndpointFqdn }
   $listenerResource = "winrm/config/Listener?Address=*+Transport=HTTPS"
-  [void](Invoke-LoggedProcess -FilePath "winrm.exe" -ArgumentList @("delete", $listenerResource))
-  $createResult = Invoke-LoggedProcess -FilePath "winrm.exe" -ArgumentList @("create", $listenerResource, "@{Hostname=`"$hostname`";CertificateThumbprint=`"$($Certificate.Thumbprint)`"}")
+  $winrm = Get-WinRmCommandPath
+  [void](Invoke-LoggedProcess -FilePath $winrm -ArgumentList @("delete", $listenerResource) -LogOutputOnSuccess:$false)
+  $createResult = Invoke-LoggedProcess -FilePath $winrm -ArgumentList @("create", $listenerResource, "@{Hostname=`"$hostname`";CertificateThumbprint=`"$($Certificate.Thumbprint)`"}") -LogOutputOnSuccess:$false
   if ($createResult.ExitCode -ne 0) {
     throw "Failed to create WinRM HTTPS listener with certificate $($Certificate.Thumbprint). See $script:LogPath"
   }
@@ -961,12 +1238,12 @@ function Register-Services {
   $accountExe = Join-Path $InstallDir "Service\WindowsAdminCenterAccountManagement.exe"
 
   Write-Log "Registering services"
-  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("create", $script:ServiceName, "type=", "own", "start=", "auto", "depend=", "winrm", "obj=", "NT AUTHORITY\NetworkService", "binPath=", "`"$svcExe`"", "DisplayName=", "Windows Admin Center"))
-  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("description", $script:ServiceName, "Manage remote Windows computers from web service."))
+  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("create", $script:ServiceName, "type=", "own", "start=", "auto", "depend=", "winrm", "obj=", "NT AUTHORITY\NetworkService", "binPath=", "`"$svcExe`"", "DisplayName=", "Windows Admin Center") -LogOutputOnSuccess:$false)
+  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("description", $script:ServiceName, "Manage remote Windows computers from web service.") -LogOutputOnSuccess:$false)
 
-  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("create", $script:AccountServiceName, "type=", "own", "start=", "demand", "binPath=", "`"$accountExe`"", "DisplayName=", "Windows Admin Center Account Management"))
-  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("description", $script:AccountServiceName, "Manage AAD token and account for Windows Admin Center."))
-  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("sdset", $script:AccountServiceName, "D:(A;;CCLCSWRPWPLO;;;NS)(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"))
+  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("create", $script:AccountServiceName, "type=", "own", "start=", "demand", "binPath=", "`"$accountExe`"", "DisplayName=", "Windows Admin Center Account Management") -LogOutputOnSuccess:$false)
+  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("description", $script:AccountServiceName, "Manage AAD token and account for Windows Admin Center.") -LogOutputOnSuccess:$false)
+  [void](Invoke-LoggedProcess -FilePath "sc.exe" -ArgumentList @("sdset", $script:AccountServiceName, "D:(A;;CCLCSWRPWPLO;;;NS)(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)") -LogOutputOnSuccess:$false)
 }
 
 function Unregister-UpdaterScheduledTask {
@@ -1021,7 +1298,7 @@ function Initialize-Database {
   }
 
   Write-Log "Initializing WAC database"
-  $result = Invoke-LoggedProcess -FilePath $efBundle -WorkingDirectory $serviceDir
+  $result = Invoke-LoggedProcess -FilePath $efBundle -WorkingDirectory $serviceDir -LogOutputOnSuccess:$false
   if ($result.ExitCode -ne 0) {
     throw "efbundle.exe failed with exit code $($result.ExitCode). See $script:LogPath"
   }
@@ -1117,7 +1394,7 @@ function Write-WacSetupMarker {
     endpointFqdn = $EndpointFqdn
     serviceFqdn = $ServiceFqdn
     certificateThumbprint = $CertificateHash
-    certificateSubject = $CertificateSubject
+    certificateSubject = Get-EffectiveCertificateSubject
     trustSelfSignedCertificate = [bool]$TrustSelfSignedCertificate
     softwareUpdateMode = $SoftwareUpdateMode
     diagnosticDataMode = $DiagnosticDataMode
@@ -1193,6 +1470,7 @@ try {
   Test-TargetArchitecture
 
   if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Get-DefaultInstallerPath }
+  if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Get-CachedWacInstaller }
   if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Save-WacInstallerFromWinget }
   if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Save-WacInstallerFromAkaMs }
   if ([string]::IsNullOrWhiteSpace($InstallerPath) -or -not (Test-Path -LiteralPath $InstallerPath)) {
@@ -1270,6 +1548,7 @@ try {
     try { New-EventLog -LogName Application -Source "WAC-Configuration" -ErrorAction SilentlyContinue } catch {}
 
     $cert = Get-OrCreateCertificate
+    Write-CertificateDiagnostics -Certificate $cert
     if ($TrustSelfSignedCertificate -and [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
       Ensure-TrustedCertificate -Certificate $cert
     }
@@ -1328,7 +1607,7 @@ try {
   Write-Host ""
   Write-UserText "FailedLog" @($script:LogPath)
   Wait-IfRequested
-  throw
+  exit 1
 }
 
 

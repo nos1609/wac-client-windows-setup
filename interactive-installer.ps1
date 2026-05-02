@@ -1503,7 +1503,10 @@ function Convert-WacTuiInstallLogLine {
       "^Port=(\d+) ServicePortRange=([0-9-]+) EndpointFqdn=(.+) ServiceFqdn=(.+)$" { return "Порты: шлюз $($matches[1]), служебные $($matches[2]); имена: $($matches[3]) / $($matches[4])" }
       "^Language=Ru$" { return "Язык интерфейса: русский" }
       "^Installer signature status: Valid$" { return "Подпись установщика проверена" }
-      "^Extracting installer payload with (.+)$" { return "Распаковка установщика: $($matches[1])" }
+      "^Installer signature signer: .+$" { return "" }
+      "^Downloading innoextract from (.+)$" { return "Загрузка innoextract: $($matches[1])" }
+      "^Downloaded and expanded innoextract official zip: (.+)$" { return "innoextract готов: $($matches[1])" }
+      "^Extracting installer payload with (.+)$" { return "Извлечение файлов WAC: $($matches[1])" }
       "^Stopping/removing previous WAC services and bindings$" { return "Остановка прежних служб и привязок WAC" }
       "^Stopping service (.+)$" { return "Остановка службы: $($matches[1])" }
       "^Copying files$" { return "Копирование файлов" }
@@ -1652,6 +1655,9 @@ function Invoke-WacTuiProcessHidden {
   $process.StartInfo.CreateNoWindow = $true
   $process.StartInfo.RedirectStandardOutput = $true
   $process.StartInfo.RedirectStandardError = $true
+  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+  $process.StartInfo.StandardOutputEncoding = $utf8NoBom
+  $process.StartInfo.StandardErrorEncoding = $utf8NoBom
   [void]$process.Start()
   $stdoutTask = $process.StandardOutput.ReadToEndAsync()
   $stderrTask = $process.StandardError.ReadToEndAsync()
@@ -1689,18 +1695,6 @@ function Add-WacTuiChildProcessOutputToLog {
   if ([string]::IsNullOrWhiteSpace($Plan.LogPath)) { return }
 
   $entries = New-Object System.Collections.Generic.List[string]
-  try {
-    $stdout = if ($Runner.StdOutTask) { $Runner.StdOutTask.Result } else { "" }
-    if (-not [string]::IsNullOrWhiteSpace($stdout)) {
-      [void]$entries.Add("[CHILD-STDOUT]")
-      foreach ($line in ($stdout -split "`r?`n")) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) { [void]$entries.Add($line) }
-      }
-    }
-  } catch {
-    [void]$entries.Add("[CHILD-STDOUT-ERROR] $($_.Exception.Message)")
-  }
-
   try {
     $stderr = if ($Runner.StdErrTask) { $Runner.StdErrTask.Result } else { "" }
     if (-not [string]::IsNullOrWhiteSpace($stderr)) {
