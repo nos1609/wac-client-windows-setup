@@ -261,7 +261,9 @@ Useful parameters:
 -ServicePortStart 6601
 -ServicePortEnd 6610
 -EndpointFqdn <name>
+-ServiceFqdn <name>
 -CertificateThumbprint <thumbprint>
+-CertificateSubject <subject>
 -SoftwareUpdateMode Automatic|Manual|Notification
 -DiagnosticDataMode Required|Optional
 -NetworkAccess LocalOnly|LocalSubnet|Any
