@@ -127,6 +127,30 @@ Describe "WacTui.Model" {
     $args -contains "Disable" | Should Be $true
   }
 
+  It "does not pass the default generated certificate subject as an explicit engine argument" {
+    $config = New-WacTuiConfig
+    $config.EndpointFqdn = "server.example.test"
+    $config.WinRmHttpsMode = "Enable"
+    $args = ConvertTo-WacSetupEngineArguments -Config $config
+    $args -contains "-CertificateSubject" | Should Be $false
+    $args -contains "WindowsAdminCenterSelfSigned" | Should Be $false
+  }
+
+  It "treats the default generated certificate subject case-insensitively" {
+    Test-WacDefaultCertificateSubject -Subject "CN=windowsadmincenterselfsigned" | Should Be $true
+    Test-WacDefaultCertificateSubject -Subject "WINDOWSADMINCENTERSELFSIGNED" | Should Be $true
+    Test-WacDefaultCertificateSubject -Subject "CN=windowsadmincenterselfsigned, O=Local" | Should Be $true
+  }
+
+  It "passes a non-default generated certificate subject as an explicit engine argument" {
+    $config = New-WacTuiConfig
+    $config.CertificateSubject = "custom-wac.test"
+    $args = ConvertTo-WacSetupEngineArguments -Config $config
+    $subjectIndex = [array]::IndexOf($args, "-CertificateSubject")
+    $subjectIndex | Should BeGreaterThan -1
+    $args[$subjectIndex + 1] | Should Be "custom-wac.test"
+  }
+
   It "does not emit TUI-only fields as setup engine arguments" {
     $config = New-WacTuiConfig
     $config.AcceptedTerms = $true
@@ -159,6 +183,7 @@ Describe "WacTui.Model" {
         endpointFqdn = "client.local"
         serviceFqdn = "localhost"
         certificateThumbprint = "ABCDEF0123456789"
+        certificateSubject = "custom-wac.local"
         softwareUpdateMode = "Notification"
         diagnosticDataMode = "Optional"
         networkAccess = "LocalSubnet"
@@ -171,6 +196,7 @@ Describe "WacTui.Model" {
       $state.IsInstalledByThisSetup | Should Be $true
       $state.Config.InstallDir | Should Be "Y:\Apps\WAC"
       $state.Config.Port | Should Be 7443
+      $state.Config.CertificateSubject | Should Be "custom-wac.local"
       $state.Config.SoftwareUpdateMode | Should Be "Notification"
       $state.Config.NetworkAccess | Should Be "LocalSubnet"
       $state.Config.SkipArchitectureCheck | Should Be $true
@@ -395,6 +421,8 @@ Describe "wac-setup-engine.ps1" {
     $text = Get-Content -LiteralPath $scriptPath -Raw
     $text.Contains("RSACertificateExtensions") | Should Be $true
     $text.Contains("GetRSAPrivateKey") | Should Be $true
+    $text.Contains("ECDsaCertificateExtensions") | Should Be $true
+    $text.Contains("GetECDsaPrivateKey") | Should Be $true
     $text.Contains("UniqueName") | Should Be $true
     $text.Contains("Key Container") | Should Be $true
     $text.Contains("Контейнер ключа") | Should Be $true
@@ -490,6 +518,129 @@ Describe "wac-setup-engine.ps1" {
     $text.Contains('$current -ne "*"') | Should Be $true
   }
 
+  It "uses the Windows winrm command script for HTTPS listener configuration" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains("function Get-WinRmCommandPath") | Should Be $true
+    $text.Contains('Get-Command "winrm.cmd"') | Should Be $true
+    $text.Contains("winrm.exe") | Should Be $false
+    $text.Contains('$winrm = Get-WinRmCommandPath') | Should Be $true
+    $text.Contains('Invoke-LoggedProcess -FilePath $winrm -ArgumentList @("create", $listenerResource') | Should Be $true
+  }
+
+  It "uses the endpoint FQDN as the generated certificate subject for WinRM HTTPS" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains("function Get-EffectiveCertificateSubject") | Should Be $true
+    $text.Contains('$WinRmHttpsMode -eq "Enable"') | Should Be $true
+    $text.Contains("return `$EndpointFqdn") | Should Be $true
+    $text.Contains('Test-IsDefaultCertificateSubject -Subject $CertificateSubject') | Should Be $true
+    $text.Contains('CertificateSubject must match EndpointFqdn when WinRM over HTTPS is enabled') | Should Be $true
+    $text.Contains('$effectiveSubject = Get-EffectiveCertificateSubject') | Should Be $true
+    $text.Contains('certificateSubject = Get-EffectiveCertificateSubject') | Should Be $true
+  }
+
+  It "does not reuse generated certificates that miss required WAC DNS names" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains("function Test-CertificateDnsName") | Should Be $true
+    $text.Contains("function Test-CertificateUsableForWac") | Should Be $true
+    $text.Contains('$requiredNames = Get-RequiredGeneratedCertificateDnsNames') | Should Be $true
+    $text.Contains('Test-CertificateUsableForWac -Certificate $_ -RequiredDnsNames $requiredNames') | Should Be $true
+    $text.Contains('does not cover required WAC names; creating a new one') | Should Be $true
+  }
+
+  It "includes the service FQDN in generated certificate DNS names" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $dnsMatch = [regex]::Match($text, "function Get-RequiredGeneratedCertificateDnsNames \{(?s).*?\n\}")
+    $dnsMatch.Success | Should Be $true
+    $dnsBody = $dnsMatch.Value
+    $dnsBody.Contains('$serviceHostname = if ([string]::IsNullOrWhiteSpace($ServiceFqdn)) { "localhost" } else { $ServiceFqdn }') | Should Be $true
+    $dnsBody.Contains('$names = @($EndpointFqdn, $env:COMPUTERNAME, $serviceHostname, "localhost")') | Should Be $true
+  }
+
+  It "only reuses generated self-signed certificates" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains("function Test-ReusableGeneratedCertificate") | Should Be $true
+    $text.Contains('$Certificate.Issuer -eq $Certificate.Subject') | Should Be $true
+    $text.Contains('$Certificate.FriendlyName -eq "Windows Admin Center Self-Signed Certificate"') | Should Be $true
+    $text.Contains('Test-CertificateHasServerAuthentication -Certificate $Certificate') | Should Be $true
+    $text.Contains('Test-CertificateHasUsablePrivateKey -Certificate $Certificate') | Should Be $true
+    $text.Contains('Test-ReusableGeneratedCertificate -Certificate $_') | Should Be $true
+  }
+
+  It "treats the default generated certificate subject case-insensitively in the engine" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $subjectMatch = [regex]::Match($text, "function Test-IsDefaultCertificateSubject \{(?s).*?\n\}")
+    $subjectMatch.Success | Should Be $true
+    $subjectBody = $subjectMatch.Value
+    $subjectBody.Contains("[System.StringComparison]::OrdinalIgnoreCase") | Should Be $true
+    $subjectBody.Contains('WindowsAdminCenterSelfSigned') | Should Be $true
+  }
+
+  It "extracts the common name from full certificate subject DNs" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $subjectMatch = [regex]::Match($text, "function Get-CertificateSubjectCommonName \{(?s).*?\n\}")
+    $subjectMatch.Success | Should Be $true
+
+    Invoke-Expression $subjectMatch.Value
+
+    Get-CertificateSubjectCommonName -Subject "CN=wac.example.com, O=Contoso" | Should Be "wac.example.com"
+    Get-CertificateSubjectCommonName -Subject "CN=WindowsAdminCenterSelfSigned" | Should Be "WindowsAdminCenterSelfSigned"
+    Get-CertificateSubjectCommonName -Subject "wac.example.com" | Should Be "wac.example.com"
+  }
+
+  It "validates supplied certificates before WinRM HTTPS listener creation" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains('Assert-SuppliedCertificateUsableForWac -Certificate $cert') | Should Be $true
+    $text.Contains('Supplied certificate $($Certificate.Thumbprint) does not cover required WAC names') | Should Be $true
+  }
+
+  It "validates supplied certificates for WAC HTTPS even when WinRM HTTPS is disabled" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $assertMatch = [regex]::Match($text, "function Assert-SuppliedCertificateUsableForWac \{(?s).*?\n\}")
+    $assertMatch.Success | Should Be $true
+    $assertBody = $assertMatch.Value
+    $assertBody.Contains('Test-CertificateUsableForWac -Certificate $Certificate -RequiredDnsNames $requiredNames') | Should Be $true
+    $assertBody.Contains('if ($WinRmHttpsMode -eq "Enable")') | Should Be $false
+  }
+
+  It "validates supplied certificates against gateway and service names" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $assertMatch = [regex]::Match($text, "function Assert-SuppliedCertificateUsableForWac \{(?s).*?\n\}")
+    $assertMatch.Success | Should Be $true
+    $assertBody = $assertMatch.Value
+    $assertBody.Contains('Test-CertificateHasUsablePrivateKey -Certificate $Certificate') | Should Be $true
+    $assertBody.Contains('$gatewayHostname = if ([string]::IsNullOrWhiteSpace($EndpointFqdn)) { $env:COMPUTERNAME } else { $EndpointFqdn }') | Should Be $true
+    $assertBody.Contains('$serviceHostname = if ([string]::IsNullOrWhiteSpace($ServiceFqdn)) { "localhost" } else { $ServiceFqdn }') | Should Be $true
+    $assertBody.Contains('$requiredNames = @($gatewayHostname, $serviceHostname)') | Should Be $true
+    $assertBody.Contains('Supplied certificate $($Certificate.Thumbprint) does not cover required WAC names') | Should Be $true
+  }
+
+  It "logs the selected certificate subject and DNS names before WinRM HTTPS configuration" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains('function Write-CertificateDiagnostics') | Should Be $true
+    $text.Contains('Certificate selected: Thumbprint=') | Should Be $true
+    $text.Contains('Certificate DNS names:') | Should Be $true
+    $text.IndexOf('Write-CertificateDiagnostics -Certificate $cert') -lt $text.IndexOf('Set-WinRmHttpsMode -Certificate $cert') | Should Be $true
+  }
+
+  It "exits with a clean error instead of rethrowing PowerShell stack traces" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains('} catch {') | Should Be $true
+    $text.Contains('exit 1') | Should Be $true
+    $text.Contains('Wait-IfRequested' + "`r`n  throw") | Should Be $false
+  }
+
   It "preserves the original TrustedHosts backup across direct engine repair" {
     $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
     $text = Get-Content -LiteralPath $scriptPath -Raw
@@ -544,6 +695,7 @@ Describe "wac-setup-engine.ps1" {
   It "can download the stock installer with winget before falling back to aka.ms" {
     $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
     $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains("function Get-CachedWacInstaller") | Should Be $true
     $text.Contains("function Save-WacInstallerFromWinget") | Should Be $true
     $text.Contains("winget.exe") | Should Be $true
     $text.Contains("download") | Should Be $true
@@ -552,7 +704,57 @@ Describe "wac-setup-engine.ps1" {
     $text.Contains("https://aka.ms/WACDownload") | Should Be $true
     $text.Contains('$script:WingetDownloadTimeoutSeconds = 120') | Should Be $true
     $text.Contains('-TimeoutSeconds $script:WingetDownloadTimeoutSeconds') | Should Be $true
+    $text.Contains('$cachedInstaller = Get-CachedWacInstaller') | Should Be $true
+    $text.Contains('Using cached Windows Admin Center installer after winget failure') | Should Be $true
     $text.IndexOf("Save-WacInstallerFromWinget") -lt $text.IndexOf("Save-WacInstallerFromAkaMs") | Should Be $true
+  }
+
+  It "can reuse the cached installer before failing after network download errors" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains('if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Get-CachedWacInstaller }') | Should Be $true
+    $text.Contains('Using cached Windows Admin Center installer: $installer') | Should Be $true
+  }
+
+  It "rejects cached installers that fail Authenticode validation before download fallback" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $cacheMatch = [regex]::Match($text, "function Get-CachedWacInstaller \{(?s).*?\n\}")
+    $cacheMatch.Success | Should Be $true
+    $cacheBody = $cacheMatch.Value
+    $text.Contains('function Test-WacInstallerAuthenticode') | Should Be $true
+    $text.Contains('Get-AuthenticodeSignature -LiteralPath $Path') | Should Be $true
+    $cacheBody.Contains('Test-WacInstallerAuthenticode -Path $installer') | Should Be $true
+    $text.Contains('Ignoring cached Windows Admin Center installer') | Should Be $true
+    $cacheBody.Contains('return ""') | Should Be $true
+    $text.IndexOf('$InstallerPath = Get-CachedWacInstaller') -lt $text.IndexOf('$InstallerPath = Save-WacInstallerFromWinget') | Should Be $true
+  }
+
+  It "continues scanning cached installers after a failed Authenticode validation" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $cacheMatch = [regex]::Match($text, "function Get-CachedWacInstaller \{(?s).*?\n\}")
+    $cacheMatch.Success | Should Be $true
+    $cacheBody = $cacheMatch.Value
+    $cacheBody.Contains('$candidates = Find-WacInstallersInDirectory -Path $downloadDir') | Should Be $true
+    $cacheBody.Contains('foreach ($installer in @($candidates))') | Should Be $true
+    $cacheBody.Contains('if (Test-WacInstallerAuthenticode -Path $installer)') | Should Be $true
+    $cacheBody.Contains('return $installer') | Should Be $true
+  }
+
+  It "keeps successful noisy external tool output out of the main log unless needed" {
+    $scriptPath = Join-Path $RepoRoot "wac-setup-engine.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains("[bool]`$LogOutputOnSuccess = `$true") | Should Be $true
+    $text.Contains('$script:NativeProcessOutputEncoding') | Should Be $true
+    $text.Contains('function Get-NativeProcessOutputEncoding') | Should Be $true
+    $text.Contains('[Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage') | Should Be $true
+    $text.Contains('[Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage') | Should Be $false
+    $text.Contains('$psi.StandardOutputEncoding = $script:NativeProcessOutputEncoding') | Should Be $true
+    $text.Contains('$stdoutTask = $process.StandardOutput.ReadToEndAsync()') | Should Be $true
+    $text.Contains('$stderrTask = $process.StandardError.ReadToEndAsync()') | Should Be $true
+    $text.Contains('$output = & $FilePath @ArgumentList 2>&1') | Should Be $false
+    $text.Contains('-LogOutputOnSuccess:$false') | Should Be $true
   }
 
   It "downloads the compatible innoextract Windows fork directly instead of the old winget package" {
@@ -795,6 +997,13 @@ Describe "WacTui apply planning" {
     $status.Contains("TCP-порт 6600 слушает подключения") | Should Be $true
     $status.Contains("Лог:") | Should Be $false
     $status.Contains("Журнал: C:\WAC-Diag\wac.log") | Should Be $true
+  }
+
+  It "translates internal setup engine log lines in the Russian install status tail" {
+    Convert-WacTuiInstallLogLine -Language "Ru" -Line "[01:00:00] [INFO] Installer signature signer: CN=Microsoft Corporation" | Should Be ""
+    Convert-WacTuiInstallLogLine -Language "Ru" -Line "[01:00:00] [STEP] Downloading innoextract from https://example.invalid/inno.zip" | Should Be "Загрузка innoextract: https://example.invalid/inno.zip"
+    Convert-WacTuiInstallLogLine -Language "Ru" -Line "[01:00:00] [INFO] Downloaded and expanded innoextract official zip: C:\WAC\innoextract.exe" | Should Be "innoextract готов: C:\WAC\innoextract.exe"
+    Convert-WacTuiInstallLogLine -Language "Ru" -Line "[01:00:00] [STEP] Extracting installer payload with C:\WAC\innoextract.exe" | Should Be "Извлечение файлов WAC: C:\WAC\innoextract.exe"
   }
 
   It "keeps install status height stable before log tail appears" {
@@ -1076,6 +1285,14 @@ Describe "WacTui process invocation" {
     $runner.Process.Dispose()
   }
 
+  It "decodes hidden child stdout and stderr as UTF-8" {
+    $scriptPath = Join-Path $RepoRoot "interactive-installer.ps1"
+    $text = Get-Content -LiteralPath $scriptPath -Raw
+    $text.Contains('$utf8NoBom = [System.Text.UTF8Encoding]::new($false)') | Should Be $true
+    $text.Contains('$process.StartInfo.StandardOutputEncoding = $utf8NoBom') | Should Be $true
+    $text.Contains('$process.StartInfo.StandardErrorEncoding = $utf8NoBom') | Should Be $true
+  }
+
   It "builds install status lines under Windows PowerShell 5.1-compatible ToArray usage" {
     $config = New-WacTuiConfig
     $config.Language = "En"
@@ -1144,7 +1361,7 @@ Describe "WacTui process invocation" {
     $signature.Contains("tail") | Should Be $false
   }
 
-  It "appends hidden child stdout and stderr to the install log on failure" {
+  It "appends hidden child stderr but not duplicated setup engine stdout to the install log on failure" {
     $logPath = Join-Path $env:TEMP "wac-child-output-test.log"
     Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
     Set-Content -LiteralPath $logPath -Value "[00:00:00] [INFO] before" -Encoding UTF8
@@ -1155,8 +1372,8 @@ Describe "WacTui process invocation" {
     }
     Add-WacTuiChildProcessOutputToLog -Plan $plan -Runner $runner
     $text = Get-Content -LiteralPath $logPath -Raw
-    $text.Contains("[CHILD-STDOUT]") | Should Be $true
-    $text.Contains("out-line") | Should Be $true
+    $text.Contains("[CHILD-STDOUT]") | Should Be $false
+    $text.Contains("out-line") | Should Be $false
     $text.Contains("[CHILD-STDERR]") | Should Be $true
     $text.Contains("err-line") | Should Be $true
   }

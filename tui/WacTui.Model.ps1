@@ -47,6 +47,7 @@ function ConvertFrom-WacSetupMarker {
   if ($Marker.endpointFqdn) { $config.EndpointFqdn = [string]$Marker.endpointFqdn }
   if ($Marker.serviceFqdn) { $config.ServiceFqdn = [string]$Marker.serviceFqdn }
   if ($Marker.certificateThumbprint) { $config.CertificateThumbprint = [string]$Marker.certificateThumbprint }
+  if ($Marker.certificateSubject) { $config.CertificateSubject = [string]$Marker.certificateSubject }
   if ($Marker.softwareUpdateMode) { $config.SoftwareUpdateMode = [string]$Marker.softwareUpdateMode }
   if ($Marker.diagnosticDataMode) { $config.DiagnosticDataMode = [string]$Marker.diagnosticDataMode }
   if ($Marker.networkAccess) { $config.NetworkAccess = [string]$Marker.networkAccess }
@@ -143,6 +144,22 @@ function Add-WacSwitchArgument {
   }
 }
 
+function Test-WacDefaultCertificateSubject {
+  param([AllowNull()][string]$Subject = "")
+
+  $value = if ($null -eq $Subject) { "" } else { $Subject.Trim() }
+  $match = [regex]::Match($value, "^\s*CN\s*=\s*([^,]+)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+  if ($match.Success) {
+    $value = $match.Groups[1].Value.Trim()
+  }
+
+  return [string]::Equals(
+    $value,
+    "WindowsAdminCenterSelfSigned",
+    [System.StringComparison]::OrdinalIgnoreCase
+  )
+}
+
 function ConvertTo-WacSetupEngineArguments {
   param(
     [Parameter(Mandatory = $true)]$Config
@@ -161,7 +178,9 @@ function ConvertTo-WacSetupEngineArguments {
   Add-WacArgument $arguments "EndpointFqdn" $Config.EndpointFqdn
   Add-WacArgument $arguments "ServiceFqdn" $Config.ServiceFqdn
   Add-WacArgument $arguments "CertificateThumbprint" $Config.CertificateThumbprint
-  Add-WacArgument $arguments "CertificateSubject" $Config.CertificateSubject
+  if ([string]::IsNullOrWhiteSpace($Config.CertificateThumbprint) -and -not (Test-WacDefaultCertificateSubject -Subject $Config.CertificateSubject)) {
+    Add-WacArgument $arguments "CertificateSubject" $Config.CertificateSubject
+  }
   Add-WacArgument $arguments "SoftwareUpdateMode" $Config.SoftwareUpdateMode
   Add-WacArgument $arguments "DiagnosticDataMode" $Config.DiagnosticDataMode
   Add-WacArgument $arguments "NetworkAccess" $Config.NetworkAccess
