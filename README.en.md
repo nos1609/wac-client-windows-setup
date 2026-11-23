@@ -94,7 +94,13 @@ When the wizard runs on ARM64, the first action screen shows a separate red warn
 
 If WAC was already installed by this package, the wizard reads the protected marker at `%ProgramFiles%\WacClientCertificateMaintenance\wac-setup.json` and shows uninstall as the first action. Normal uninstall removes services, the scheduled task, HTTP.SYS binding, firewall rules, and program files, while keeping WAC data. Full uninstall also removes the WAC data directory and is highlighted as a risky action. During upgrade or certificate recovery, setup checks the legacy installation path against the registered service and moves the marker out of the data directory.
 
-To upgrade an existing installation to the current Administration Mode, run `.\wac-setup-engine.ps1 -RefreshInstaller` in elevated PowerShell. This downloads a fresh Microsoft-signed EXE to a separate directory, extracts it there, and preserves data for an installation with a marker. The default path still supports offline setup from a local EXE or cache. The WAC 2611 installer (WinGet package 3.0.0.6) combines Administration Mode and Virtualization Mode. The wrapper configures the Administration Mode services.
+To upgrade an existing installation to Administration Mode, open PowerShell as administrator in the wrapper directory.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -RefreshInstaller
+```
+
+This downloads a fresh Microsoft-signed EXE to a separate directory, extracts it there, and preserves data for an installation with a marker. The default path still supports offline setup from a local EXE or cache. The WAC 2611 installer (WinGet package 3.0.0.6) combines Administration Mode and Virtualization Mode. The wrapper configures the Administration Mode services.
 
 During an upgrade, setup rebuilds the program directory and the `Updater` data subdirectory from the verified package. Administrators and SYSTEM can write to executable files. The WAC service retains write access to the database and logs. For custom paths, select separate local directories with protected parent directories.
 
@@ -348,12 +354,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -
 
 ### Recover and renew the gateway certificate
 
-If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate that the gateway serves. Open PowerShell as administrator. Use the recovery command for the certificate source. Add `-DataDir` if the installation uses a custom data directory.
+If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate that the gateway serves. Open PowerShell as administrator in the wrapper directory. Use the recovery command for the certificate source. Add `-DataDir` if the installation uses a custom data directory.
 
 **Wrapper-managed certificate.** Run the renewal command.
 
 ```powershell
-.\wac-setup-engine.ps1 -RenewCertificate
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -RenewCertificate
 ```
 
 Recovery checks the thumbprints in the marker, both WAC settings, the HTTP.SYS binding, and the WinRM HTTPS listener if the wrapper configured it. With seven days or less left, it rotates the certificate, restarts the gateway, and verifies the new thumbprint over TLS for the gateway names, including `localhost`. A failed probe restores the previous bindings. The previous certificate stays in the store.
@@ -367,10 +373,18 @@ Get-ScheduledTaskInfo -TaskName WacClientCertificateRenewal
 **Operator-managed certificate.** Install the replacement certificate and its private key in `Cert:\LocalMachine\My`. The gateway must trust its chain. Replace `<THUMBPRINT>` with the new certificate's 40-digit hexadecimal thumbprint and reinstall WAC while preserving its data.
 
 ```powershell
-.\wac-setup-engine.ps1 -KeepExistingData -CertificateThumbprint '<THUMBPRINT>'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData -CertificateThumbprint '<THUMBPRINT>'
 ```
 
 Setup checks the replacement certificate and its chain before it stops the WAC services. If validation fails, the current installation keeps running.
+
+**Valid certificate, Schannel error `0x8009030D`.** If `NETWORK SERVICE` lost read access to the private key, reinstall during a maintenance window. Use the same WAC installer version and keep the existing data. Setup stops the WAC services and grants `NETWORK SERVICE` (`S-1-5-20`) read access to the selected certificate’s key file.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData -InstallerPath C:\Temp\WindowsAdminCenter.exe
+```
+
+If the setup log in `C:\WAC-Diag` reports `No certificate private key ACL was changed`, check the key permissions with the certificate provider. Verify HTTPS after the repair.
 
 **Verify the gateway.** On the gateway PC, read the configured port from the protected marker (default port `6600`). The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
 
@@ -382,4 +396,4 @@ curl.exe --head "https://localhost:$gatewayPort/"
 
 To check TCP reachability alone, run `Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet`. A `True` result confirms that a listener accepted the connection. Use the HTTPS check above to authenticate the gateway and validate its certificate.
 
-For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If the certificate is still valid and Schannel reports `0x8009030D`, check private key access for `NETWORK SERVICE`.
+For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned.
