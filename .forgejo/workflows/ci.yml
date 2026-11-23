@@ -20,11 +20,22 @@ jobs:
     runs-on: self-hosted
     outputs:
       base: ${{ steps.range.outputs.base_commit }}
+      head: ${{ steps.candidate.outputs.head }}
     steps:
       - uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Bind the checked-out commit to the event
+        id: candidate
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse --verify HEAD)
+          [[ "$head" =~ ^[0-9a-f]{40}$ && "$head" == "$EVENT_SHA" ]]
+          printf 'head=%s\n' "$head" >> "$GITHUB_OUTPUT"
       - name: Check out the shared range action
         uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -51,7 +62,7 @@ jobs:
     uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@2e2efbb3ba05593e5bf6ed644537b4e87fb9e924
     with:
       base_commit: ${{ needs.prepare.outputs.base }}
-      head_commit: ${{ github.sha }}
+      head_commit: ${{ needs.prepare.outputs.head }}
       script_path: scripts/test-portable.ps1
       runs_on: self-hosted
 
@@ -87,11 +98,11 @@ jobs:
           printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
 
   review:
-    needs: [portable, review_range]
+    needs: [prepare, portable, review_range]
     uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@2e2efbb3ba05593e5bf6ed644537b4e87fb9e924
     with:
       base_commit: ${{ needs.review_range.outputs.base }}
-      expected_head_sha: ${{ github.sha }}
+      expected_head_sha: ${{ needs.prepare.outputs.head }}
       workflow_id: ci.yml
       continue_on_error: false
       upload_prompts: false
