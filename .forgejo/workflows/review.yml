@@ -1,0 +1,52 @@
+name: WAC CodeRabbit review
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_commit:
+        description: Full SHA of the review base
+        required: true
+        type: string
+      expected_head_sha:
+        description: Full SHA of the candidate to review
+        required: true
+        type: string
+
+concurrency:
+  group: wac-review-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: self-hosted
+    steps:
+      - name: Verify the private review target
+        shell: bash
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+          CANDIDATE_REF: ${{ github.ref }}
+          EVENT_HEAD: ${{ github.sha }}
+          EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "${IS_PRIVATE,,}" == true ]]
+          [[ "$CANDIDATE_REF" == refs/heads/main || "$CANDIDATE_REF" == refs/heads/feature/* ]]
+          [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ && "$EXPECTED_HEAD" == "$EVENT_HEAD" ]]
+
+  portable:
+    needs: prepare
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@6e799b414b34b6a56fd059a767220ab3c538223e
+    with:
+      base_commit: ${{ inputs.base_commit }}
+      head_commit: ${{ inputs.expected_head_sha }}
+      script_path: scripts/test-portable.ps1
+
+  review:
+    needs: portable
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@6e799b414b34b6a56fd059a767220ab3c538223e
+    with:
+      base_commit: ${{ inputs.base_commit }}
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      workflow_id: review.yml
+      continue_on_error: false
+      upload_prompts: false

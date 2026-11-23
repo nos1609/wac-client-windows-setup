@@ -1,4 +1,4 @@
-name: WAC candidate checks
+name: WAC portable checks
 
 on:
   push:
@@ -9,11 +9,11 @@ on:
         description: Full base commit SHA for the trusted candidate
         required: true
         type: string
-      coderabbit:
-        description: Run CodeRabbit on the selected range after the portable checks pass
-        required: false
-        type: boolean
-        default: false
+
+# A new push checks the newest commit on that branch. Manual runs have their own queue.
+concurrency:
+  group: wac-portable-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   prepare:
@@ -46,14 +46,3 @@ jobs:
       head_commit: ${{ github.sha }}
       script_path: scripts/test-portable.ps1
       runs_on: self-hosted
-
-  review:
-    needs: [prepare, portable]
-    if: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.coderabbit) == 'true' }}
-    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@6e799b414b34b6a56fd059a767220ab3c538223e
-    with:
-      expected_head_sha: ${{ github.sha }}
-      base_commit: ${{ needs.prepare.outputs.base }}
-      workflow_id: ci.yml
-      continue_on_error: false
-      upload_prompts: false
