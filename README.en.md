@@ -55,7 +55,7 @@ Before publishing, run from the repository root:
 .\scripts\build-dist.ps1
 ```
 
-`test-release.ps1` checks PowerShell syntax, Pester tests, PSScriptAnalyzer when the module is available, local-path leaks, and forbidden binaries. `build-dist.ps1` creates `dist\wac-client-windows-setup.zip` and a matching SHA256 file.
+`test-release.ps1` runs the full Windows test suite with Pester 4.10.1. It also checks PowerShell syntax, runs PSScriptAnalyzer when available, and checks for local paths and forbidden binaries. `build-dist.ps1` creates `dist\wac-client-windows-setup.zip` and a matching SHA256 file.
 
 ## Quick Start
 
@@ -386,20 +386,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -
 
 If the setup log in `C:\WAC-Diag` reports `No certificate private key ACL was changed`, check the key permissions with the certificate provider. Verify HTTPS after the repair.
 
-**Verify the gateway.** Run both checks on the gateway PC. The commands read the port from the protected marker. If the file is missing or the port is unspecified, they use the default port `6600`. If a legacy installation uses a custom port, replace `6600` with that port. The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
+**Verify the gateway.** Run both checks on the gateway PC. The commands read the port from the protected marker. If the file is missing or the port is unspecified, they use the default port `6600`. Malformed JSON or a nonnumeric port stops the check with an error. If a legacy installation uses a custom port, replace `6600` with that port. The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
 
 ```powershell
-$markerPath = Join-Path $env:ProgramFiles 'WacClientCertificateMaintenance\wac-setup.json'
-$gatewayPort = 6600
-if (Test-Path -LiteralPath $markerPath -ErrorAction Stop) {
-  $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-  $port = $marker.PSObject.Properties['port']
-  if ($port -and -not [string]::IsNullOrWhiteSpace($port.Value)) {
-    $gatewayPort = [int]$port.Value
+& {
+  $ErrorActionPreference = 'Stop'
+  $markerPath = Join-Path $env:ProgramFiles 'WacClientCertificateMaintenance\wac-setup.json'
+  $gatewayPort = 6600
+  if (Test-Path -LiteralPath $markerPath -ErrorAction Stop) {
+    $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $port = $marker.PSObject.Properties['port']
+    if ($port -and -not [string]::IsNullOrWhiteSpace($port.Value)) {
+      $gatewayPort = [int]$port.Value
+    }
   }
+  Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet
+  curl.exe --head "https://localhost:$gatewayPort/"
 }
-Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet
-curl.exe --head "https://localhost:$gatewayPort/"
 ```
 
 A `True` result from `Test-NetConnection` confirms that a TCP listener accepted the connection. The HTTPS check verifies the gateway certificate and returns the HTTP response headers.
