@@ -1490,9 +1490,8 @@ function Test-TcpPort {
 }
 
 function Read-WacSetupMarker {
-  param([string]$MarkerDataDir = $DataDir)
+  param([string]$Path = (Get-WacReadableMarkerPath $DataDir))
 
-  $path = Get-WacReadableMarkerPath $MarkerDataDir
   if (-not (Test-Path -LiteralPath $path)) { return $null }
   try {
     Assert-WacLocalPath $path
@@ -1516,9 +1515,11 @@ function Get-WacMarkerValue {
 }
 
 function Assert-WacMarkerDirectories {
-  param($Marker)
+  param($Marker, [switch]$ProtectedMarker)
   $recorded = [IO.Path]::GetFullPath($Marker.installDir).TrimEnd('\')
-  if ([IO.Path]::GetFullPath($Marker.dataDir).TrimEnd('\') -ne [IO.Path]::GetFullPath($DataDir).TrimEnd('\')) {
+  # A legacy marker must describe the directory from which it was read.
+  if ((-not $ProtectedMarker -or $script:OriginalBoundParameters.ContainsKey('DataDir')) -and
+      [IO.Path]::GetFullPath($Marker.dataDir).TrimEnd('\') -ne [IO.Path]::GetFullPath($DataDir).TrimEnd('\')) {
     throw 'The WAC marker points outside the selected data directory.'
   }
   if ($script:OriginalBoundParameters.ContainsKey('InstallDir') -and [IO.Path]::GetFullPath($InstallDir).TrimEnd('\') -ne $recorded) {
@@ -1529,7 +1530,7 @@ function Assert-WacMarkerDirectories {
     if ($installed.PathName.Trim('"') -ne [IO.Path]::Combine($recorded, 'Service', 'WindowsAdminCenter.exe')) {
       throw 'The installation directory does not match the registered gateway service.'
     }
-  } elseif (-not [IO.File]::Exists((Get-WacProtectedMarkerPath))) {
+  } elseif (-not $ProtectedMarker) {
     throw 'Cannot verify the legacy installation directory without the registered gateway service.'
   }
 }
@@ -1600,6 +1601,27 @@ function Write-WacSetupMarker {
   Write-Log "Wrote setup marker: $markerPath"
 }
 
+function Complete-WacGatewaySetup {
+  param($Certificate, [string]$ProductVersion, [string]$EnginePath)
+
+  # Service configuration is live even if the following TLS probe fails.
+  Write-WacSetupMarker -ProductVersion $ProductVersion -CertificateHash $Certificate.Thumbprint
+  if ($CertificateThumbprint) {
+    Remove-WacRenewalTask
+  } else {
+    Register-WacRenewalTask -Marker (Read-WacSetupMarker) -EnginePath $EnginePath
+  }
+
+  if (Test-TcpPort -TcpPort $Port) {
+    Write-Log "TCP port $Port is listening"
+  } else {
+    Write-Log "Service is running but TCP port $Port did not accept a local connection yet" "WARN"
+  }
+
+  $probeNames = if ($CertificateThumbprint) { @($EndpointFqdn, $ServiceFqdn) } else { Get-RequiredGeneratedCertificateDnsNames }
+  Assert-WacServedCertificate -Certificate $Certificate -Names $probeNames -Port $Port -AllowUntrustedRoot:(!$CertificateThumbprint -and !$TrustSelfSignedCertificate)
+}
+
 function Remove-WacSetupMarker {
   foreach ($path in @((Get-WacSetupMarkerPath $DataDir), (Get-WacProtectedMarkerPath))) {
     if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
@@ -1663,9 +1685,10 @@ try {
     }
     return
   }
-  $setupMarker = Read-WacSetupMarker -MarkerDataDir $DataDir
+  $markerPath = Get-WacReadableMarkerPath $DataDir
+  $setupMarker = Read-WacSetupMarker -Path $markerPath
   if ($setupMarker) {
-    Assert-WacMarkerDirectories -Marker $setupMarker
+    Assert-WacMarkerDirectories -Marker $setupMarker -ProtectedMarker:($markerPath -eq (Get-WacProtectedMarkerPath))
   }
   if ($RenewCertificate) {
     if (-not $setupMarker) { throw 'Certificate recovery requires an existing WAC wrapper marker.' }
@@ -1833,21 +1856,8 @@ try {
       throw "WindowsAdminCenter service is not running. Status=$($svc.Status). See $script:LogPath"
     }
 
-    if (Test-TcpPort -TcpPort $Port) {
-      Write-Log "TCP port $Port is listening"
-    } else {
-      Write-Log "Service is running but TCP port $Port did not accept a local connection yet" "WARN"
-    }
-
     $productVersion = Get-InstallerProductVersion -Path $InstallerPath
-    $probeNames = if ($CertificateThumbprint) { @($EndpointFqdn, $ServiceFqdn) } else { Get-RequiredGeneratedCertificateDnsNames }
-    Assert-WacServedCertificate -Certificate $cert -Names $probeNames -Port $Port -AllowUntrustedRoot:(!$CertificateThumbprint -and !$TrustSelfSignedCertificate)
-    Write-WacSetupMarker -ProductVersion $productVersion -CertificateHash $cert.Thumbprint
-    if ($CertificateThumbprint) {
-      Remove-WacRenewalTask
-    } else {
-      Register-WacRenewalTask -Marker (Read-WacSetupMarker) -EnginePath $PSCommandPath
-    }
+    Complete-WacGatewaySetup -Certificate $cert -ProductVersion $productVersion -EnginePath $PSCommandPath
   }
 
   Write-Host ""

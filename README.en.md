@@ -354,7 +354,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -
 
 ### Recover and renew the gateway certificate
 
-If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate that the gateway serves. Open PowerShell as administrator in the wrapper directory. Use the recovery command for the certificate source. Add `-DataDir` if the installation uses a custom data directory.
+If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate that the gateway serves. Open PowerShell as administrator in the wrapper directory. Use the recovery command for the certificate source. The protected marker records the data directory. For an older installation with its marker in a custom data directory, specify that directory with `-DataDir`.
 
 **Wrapper-managed certificate.** Run the renewal command.
 
@@ -386,14 +386,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -
 
 If the setup log in `C:\WAC-Diag` reports `No certificate private key ACL was changed`, check the key permissions with the certificate provider. Verify HTTPS after the repair.
 
-**Verify the gateway.** On the gateway PC, read the configured port from the protected marker (default port `6600`). The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
+**Verify the gateway.** Run both checks on the gateway PC. The commands use the port from the protected marker and fall back to the default port `6600` if the file is absent. If a legacy installation uses a custom port, replace `6600` with that port. The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
 
 ```powershell
 $markerPath = Join-Path $env:ProgramFiles 'WacClientCertificateMaintenance\wac-setup.json'
-$gatewayPort = (Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json).port
+$gatewayPort = if (Test-Path -LiteralPath $markerPath -ErrorAction Stop) {
+  (Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).port
+} else { 6600 }
+Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet
 curl.exe --head "https://localhost:$gatewayPort/"
 ```
 
-To check TCP reachability alone, run `Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet`. A `True` result confirms that a listener accepted the connection. Use the HTTPS check above to authenticate the gateway and validate its certificate.
+A `True` result from `Test-NetConnection` confirms that a TCP listener accepted the connection. The HTTPS check verifies the gateway certificate and returns the HTTP response headers.
 
 For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned.

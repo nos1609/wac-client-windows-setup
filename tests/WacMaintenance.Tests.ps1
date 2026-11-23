@@ -64,6 +64,22 @@ Describe 'WAC certificate maintenance' {
       (Get-Content -LiteralPath $selected -Raw | ConvertFrom-Json).port | Should -Be 7443
     }
 
+    It 'uses a custom data directory from a protected marker when no directory was specified' {
+      if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        function Get-CimInstance { param($ClassName,$Filter) }
+      }
+      $DataDir = Join-Path $TestDrive 'default-data'
+      $marker = [pscustomobject]@{installDir=(Join-Path $TestDrive 'program'); dataDir=(Join-Path $TestDrive 'custom-data')}
+      $script:OriginalBoundParameters = @{}
+      Mock Get-CimInstance { [pscustomobject]@{PathName=[IO.Path]::Combine($TestDrive,'program','Service','WindowsAdminCenter.exe')} }
+      Assert-WacMarkerDirectories -Marker $marker -ProtectedMarker
+      Assert-FailsWith { Assert-WacMarkerDirectories -Marker $marker } 'selected data directory'
+      $script:OriginalBoundParameters = @{DataDir=$DataDir}
+      Assert-FailsWith { Assert-WacMarkerDirectories -Marker $marker -ProtectedMarker } 'selected data directory'
+      $DataDir = $marker.dataDir
+      Assert-WacMarkerDirectories -Marker $marker -ProtectedMarker
+    }
+
     It 'rejects an unverified legacy removal path before touching the installation' {
       if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
         function Get-CimInstance { param($ClassName,$Filter) }
@@ -78,6 +94,38 @@ Describe 'WAC certificate maintenance' {
       Assert-WacMarkerDirectories $marker
       Mock Get-CimInstance { $null }
       Assert-FailsWith { Assert-WacMarkerDirectories $marker } 'without the registered gateway service'
+    }
+  }
+
+  Context 'Final gateway verification' {
+    It 'records the installed certificate and renewal mode before a failing TLS check (<mode>)' -TestCases @(
+      @{mode='Generated'}, @{mode='Explicit'}
+    ) {
+      param($mode)
+      $cert = [pscustomobject]@{Thumbprint=('B'*40)}
+      $CertificateThumbprint = if ($mode -eq 'Explicit') { $cert.Thumbprint } else { '' }
+      $EndpointFqdn = 'gateway.example.test'
+      $ServiceFqdn = 'localhost'
+      $Port = 7443
+      $TrustSelfSignedCertificate = $false
+      $script:record = [pscustomobject]@{productVersion='old'; certificateThumbprint=('A'*40)}
+      $script:taskMode = 'old'
+      Mock Write-WacSetupMarker {
+        $script:record.productVersion = $ProductVersion
+        $script:record.certificateThumbprint = $CertificateHash
+      }
+      Mock Read-WacSetupMarker { $script:record }
+      Mock Register-WacRenewalTask { $script:taskMode = $Marker.certificateThumbprint }
+      Mock Remove-WacRenewalTask { $script:taskMode = 'removed' }
+      Mock Write-Log {}
+      Mock Test-TcpPort { $true }
+      Mock Get-RequiredGeneratedCertificateDnsNames { @('gateway.example.test','localhost') }
+      Mock Assert-WacServedCertificate { throw 'TLS check failed' }
+      Assert-FailsWith { Complete-WacGatewaySetup -Certificate $cert -ProductVersion '2611' -EnginePath 'engine.ps1' } 'TLS check failed'
+      $script:record.productVersion | Should -Be '2611'
+      $script:record.certificateThumbprint | Should -Be $cert.Thumbprint
+      $expectedTask = if ($mode -eq 'Explicit') { 'removed' } else { $cert.Thumbprint }
+      $script:taskMode | Should -Be $expectedTask
     }
   }
 
