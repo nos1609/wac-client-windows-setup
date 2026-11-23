@@ -94,6 +94,8 @@ When the wizard runs on ARM64, the first action screen shows a separate red warn
 
 If WAC was already installed by this package, the wizard detects `C:\ProgramData\WindowsAdminCenter\wac-setup.json` and shows uninstall as the first action. Normal uninstall removes services, the scheduled task, HTTP.SYS binding, firewall rules, and program files, while keeping WAC data. Full uninstall also removes the WAC data directory and is highlighted as a risky action.
 
+To upgrade an existing installation to the current Administration Mode, run `.\wac-setup-engine.ps1 -RefreshInstaller` in elevated PowerShell. This downloads a fresh Microsoft-signed EXE to a separate directory, extracts it there, and preserves data for an installation with a marker. The default path still supports offline setup from a local EXE or cache. The WAC 2611 installer (WinGet package 3.0.0.6) combines Administration Mode and Virtualization Mode. The wrapper configures the Administration Mode services.
+
 The canonical Microsoft installer URL is `https://aka.ms/WACDownload`. Microsoft Learn uses this URL for the PowerShell installation path for Windows Admin Center.
 
 The official WAC installer is not bundled as a binary in the publish package. `wac-setup-engine.ps1` first uses Windows Package Manager only to download the installer:
@@ -342,27 +344,21 @@ By default, existing WAC files and data are replaced. To preserve `C:\ProgramDat
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData
 ```
 
-If WAC services are running and port `6600` is listening, but the browser or `curl -k -I https://localhost:6600` fails during TLS handshake, check Schannel in the System Event Log. Error `0x8009030D` usually means the HTTPS layer cannot read the WAC certificate private key as `NETWORK SERVICE`.
+### Recover and renew the gateway certificate
 
-In that case, the clean repair path is to rotate WAC to a new certificate instead of reusing the old key binding:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData -TrustSelfSignedCertificate
-```
-
-On ARM64:
+If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate that the gateway serves. For an existing wrapper installation, open PowerShell as administrator and run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -SkipArchitectureCheck -KeepExistingData -TrustSelfSignedCertificate
+.\wac-setup-engine.ps1 -RenewCertificate
 ```
 
-These commands preserve `C:\ProgramData\WindowsAdminCenter` and create or reuse a certificate for the current `Endpoint FQDN`. If WAC must open through an external CNAME, pass it explicitly with `-EndpointFqdn`; with WinRM over HTTPS enabled, that FQDN becomes the CN of the generated certificate, while `Internal service FQDN` and `localhost` remain in SAN. If the machine already has an old generated WAC certificate with unsuitable names, it is not reused.
-The repair flow also adds the generated self-signed certificate to `LocalMachine\Root`, because some internal WAC/.NET TLS calls can still reject an untrusted chain even when the gateway itself is running. This trust anchor remains in the store after WAC uninstall until you remove the certificate manually.
+Add `-DataDir` for a custom data directory. Recovery checks the thumbprints in the marker, both WAC settings, the HTTP.SYS binding, and the WinRM HTTPS listener if the wrapper configured it. With seven days or less left, it rotates the certificate, restarts the gateway, and verifies the new thumbprint over TLS for the gateway names, including `localhost`. A failed probe restores the previous bindings. The previous certificate stays in the store.
 
+Installation or recovery of a wrapper-managed certificate registers the daily `WacClientCertificateRenewal` task. A missed run starts when possible. To trust the new certificate on the gateway PC, add `-TrustSelfSignedCertificate` to the recovery command. Remote clients that trust the individual self-signed certificate must trust the new thumbprint after rotation. Check the task and TLS with:
 
+```powershell
+Get-ScheduledTaskInfo -TaskName WacClientCertificateRenewal
+curl.exe --head https://localhost:6600
+```
 
-
-
-
-
-
+For an operator-managed certificate, supply a new valid `-CertificateThumbprint` during setup with `-KeepExistingData`. For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If the certificate is still valid and Schannel reports `0x8009030D`, check private key access for `NETWORK SERVICE`.

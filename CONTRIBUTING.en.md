@@ -31,3 +31,9 @@ The project uses SemVer in the `VERSION` file without a leading `v`; release git
 - `PATCH`: fixes to our scripts, documentation, CI, and release process without changing the user-facing contract.
 - `MINOR`: support for a new Windows Admin Center version or new backward-compatible installer capabilities.
 - `MAJOR`: incompatible CLI, package layout, setup-logic changes, or a large refactor that needs careful migration.
+
+## Verify a candidate across two repositories
+
+Develop in private Forgejo. Push the candidate to a `codex/candidate-*` branch. The workflow calls a SHA-pinned `fj-actions-common/pester-ci`, checks the commit range, runs the portable tests, and checks the ZIP contents and SHA256. For a manual run, supply the full ancestor SHA in `base_commit`. The runner must provide Bash, Node, pwsh 7.6+, and Pester 6.2+ as required by the common workflow.
+
+GitHub hosts public PRs, Dependabot, and Windows CI. Promote the same verified commit. Before publication, check the ancestry of both `main` branches. Compare their SHAs after promotion. Include commits accepted through GitHub PRs in the next private verification. Stop promotion if the branches diverge. Tagging and publishing a release ZIP require a separate decision.

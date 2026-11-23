@@ -28,17 +28,18 @@ function Get-PublicFiles {
     "VERSION",
     "SECURITY.md",
     "SECURITY.en.md",
-    "wac-setup-engine.ps1"
+    "wac-setup-engine.ps1",
+    "wac-certificate.ps1"
   )
 
   foreach ($relativePath in $publicRootFiles) {
     $path = Join-Path $repoRoot $relativePath
     if (Test-Path -LiteralPath $path) {
-      Get-Item -LiteralPath $path
+      Get-Item -LiteralPath $path -Force
     }
   }
 
-  foreach ($relativePath in @(".github", "scripts", "tests", "tui")) {
+  foreach ($relativePath in @(".github", ".forgejo", "scripts", "tests", "tui")) {
     $path = Join-Path $repoRoot $relativePath
     if (Test-Path -LiteralPath $path) {
       Get-ChildItem -LiteralPath $path -Recurse -Force -File
@@ -58,6 +59,7 @@ foreach ($relativePath in @(
   "AGENTS.md",
   "interactive-installer.ps1",
   "wac-setup-engine.ps1",
+  "wac-certificate.ps1",
   "tui\WacTui.Locale.ps1",
   "tui\WacTui.Model.ps1",
   "tui\WacTui.Progress.ps1",

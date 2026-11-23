@@ -35,6 +35,10 @@ param(
   [ValidateSet("Enable", "Disable")]
   [string]$WinRmHttpsMode = "Disable",
   [switch]$TrustSelfSignedCertificate,
+  [switch]$GenerateCertificate,
+  [switch]$RenewCertificate,
+  [switch]$ScheduledRenewal,
+  [switch]$RefreshInstaller,
   [switch]$SkipExtraction,
   [switch]$SkipPsRemoting,
   [switch]$KeepExistingData,
@@ -302,6 +306,10 @@ function Wait-IfRequested {
   }
 }
 
+if ($WhatIfPreference) {
+  Write-Host 'Preview only. No WAC installation or maintenance operations will run.'
+  return
+}
 Invoke-SelfElevated
 New-Item -ItemType Directory -Path $script:DiagDir -Force | Out-Null
 
@@ -488,7 +496,7 @@ function Save-WacInstallerFromWinget {
 }
 
 function Save-WacInstallerFromAkaMs {
-  $downloadDir = Get-InstallerDownloadDirectory
+  param([string]$DownloadDir = (Get-InstallerDownloadDirectory))
   New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
 
   $target = Join-Path $downloadDir "WindowsAdminCenter.exe"
@@ -651,6 +659,31 @@ function Get-InstallerProductVersion {
   return $version.Trim()
 }
 
+function Test-WacAdministrationTemplate {
+  param([Parameter(Mandatory = $true)]$Template)
+  $wac = $Template.WindowsAdminCenter
+  $services = @($wac.Services)
+  return ($services.Count -eq 2 -and $services[0].Name -eq 'WinREST' -and $services[1].Name -eq 'WinStream' -and
+    -not $wac.PSObject.Properties['EnterpriseService'])
+}
+
+function Resolve-WacAdministrationTemplate {
+  param([string]$PayloadApp)
+  $config = Join-Path $PayloadApp 'Service\appsettings.json'
+  if (Test-WacAdministrationTemplate (Read-WacAppSettingsJson $config)) { return $config }
+  if ($SkipExtraction) { throw 'Offline payload must contain the Administration Mode appsettings.json.' }
+  # In the combined installer, two conditional entries target the same path.
+  $scratch = Join-Path $ExtractOut ('config-' + [guid]::NewGuid().ToString('N'))
+  $result = Invoke-LoggedProcess -FilePath $InnoExtractPath -ArgumentList @(
+    '--silent','--collisions','rename','--include','app/Service/appsettings.json','--output-dir',$scratch,$InstallerPath
+  )
+  if ($result.ExitCode -ne 0) { throw 'Could not extract the Administration Mode configuration variants.' }
+  $matchesAdmin = @(Get-ChildItem -LiteralPath (Join-Path $scratch 'app\Service') -File -Filter 'appsettings.json*' |
+    Where-Object { Test-WacAdministrationTemplate (Read-WacAppSettingsJson $_.FullName) })
+  if ($matchesAdmin.Count -ne 1) { throw 'Cannot identify a unique Administration Mode configuration.' }
+  return $matchesAdmin[0].FullName
+}
+
 function Get-WacAppSettingsNuGetVersion {
   param(
     [Parameter(Mandatory = $true)]$AppSettings,
@@ -675,12 +708,13 @@ function Get-WacAppSettingsNuGetVersion {
 function Copy-DirectoryContents {
   param(
     [Parameter(Mandatory = $true)][string]$Source,
-    [Parameter(Mandatory = $true)][string]$Destination
+    [Parameter(Mandatory = $true)][string]$Destination,
+    [string[]]$Exclude = @()
   )
 
   if (-not (Test-Path -LiteralPath $Source)) { throw "Source directory not found: $Source" }
   New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-  Get-ChildItem -LiteralPath $Source -Force | Copy-Item -Destination $Destination -Recurse -Force
+  Get-ChildItem -LiteralPath $Source -Force | Where-Object { $_.Name -notin $Exclude } | Copy-Item -Destination $Destination -Recurse -Force
 }
 
 function Stop-And-DeleteService {
@@ -893,6 +927,7 @@ function Test-ReusableGeneratedCertificate {
   return (
     $Certificate.Issuer -eq $Certificate.Subject -and
     $Certificate.FriendlyName -eq "Windows Admin Center Self-Signed Certificate" -and
+    (Test-WacEndEntityCertificate $Certificate) -and
     (Test-CertificateHasServerAuthentication -Certificate $Certificate) -and
     (Test-CertificateHasUsablePrivateKey -Certificate $Certificate)
   )
@@ -901,6 +936,10 @@ function Test-ReusableGeneratedCertificate {
 function Assert-SuppliedCertificateUsableForWac {
   param([Parameter(Mandatory = $true)]$Certificate)
 
+  $now = Get-Date
+  if ($now -lt $Certificate.NotBefore -or $now -ge $Certificate.NotAfter) {
+    throw "Certificate $($Certificate.Thumbprint) is outside its validity period: $($Certificate.NotBefore) to $($Certificate.NotAfter)."
+  }
   if (-not (Test-CertificateHasUsablePrivateKey -Certificate $Certificate)) {
     throw "Supplied certificate $($Certificate.Thumbprint) does not have an accessible private key."
   }
@@ -938,7 +977,7 @@ function Get-OrCreateCertificate {
   $subject = if ($effectiveSubject.StartsWith("CN=")) { $effectiveSubject } else { "CN=$effectiveSubject" }
   $requiredNames = Get-RequiredGeneratedCertificateDnsNames
   $cert = Get-ChildItem Cert:\LocalMachine\My\* -ErrorAction SilentlyContinue |
-    Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date).AddDays(7) } |
+    Where-Object { $_.Subject -eq $subject -and $_.NotBefore -le (Get-Date) -and $_.NotAfter -gt (Get-Date).AddDays(7) } |
     Where-Object { Test-ReusableGeneratedCertificate -Certificate $_ } |
     Where-Object { Test-CertificateUsableForWac -Certificate $_ -RequiredDnsNames $requiredNames } |
     Sort-Object NotAfter -Descending |
@@ -960,7 +999,7 @@ function Get-OrCreateCertificate {
   Write-Log "Creating self-signed certificate for $EndpointFqdn"
   $newCertSubject = if ($effectiveSubject.StartsWith("CN=")) { $effectiveSubject } else { "CN=$effectiveSubject" }
   $keySecurity = New-Object System.Security.AccessControl.FileSecurity
-  $keySecurity.SetSecurityDescriptorSddlForm("O:SYG:SYD:AI(A;;GAGR;;;SY)(A;;GAGR;;;NS)(A;;GAGR;;;BA)(A;;GR;;;BU)")
+  $keySecurity.SetSecurityDescriptorSddlForm("O:SYG:SYD:AI(A;;GAGR;;;SY)(A;;GAGR;;;NS)(A;;GAGR;;;BA)")
   $certArgs = @{
     Subject           = $newCertSubject
     DnsName           = $requiredNames
@@ -990,7 +1029,7 @@ function Ensure-TrustedCertificate {
   }
 
   Write-Log "Trusting certificate in LocalMachine Root: $($Certificate.Thumbprint)"
-  $tmp = Join-Path $env:TEMP ("wac-{0}.cer" -f $Certificate.Thumbprint)
+  $tmp = Join-Path (Get-WacMaintenanceDirectory) ([guid]::NewGuid().ToString('N') + '.cer')
   try {
     Export-Certificate -Cert $Certificate -FilePath $tmp -Type CERT | Out-Null
     Import-Certificate -FilePath $tmp -CertStoreLocation Cert:\LocalMachine\Root -ErrorAction Stop | Out-Null
@@ -1113,8 +1152,13 @@ function Configure-AppSettings {
   Set-JsonValue $json @("WindowsAdminCenter", "System", "SoftwareUpdate") $SoftwareUpdateMode
   Set-JsonValue $json @("WindowsAdminCenter", "System", "TelemetryPrivacy") $DiagnosticDataMode
   Set-JsonValue $json @("WindowsAdminCenter", "System", "InstallDate") (Get-Date -Format "yyyyMMdd")
-  Set-JsonValue $json @("WindowsAdminCenter", "System", "FileVersion") ((Get-Item -LiteralPath $InstallerPath).VersionInfo.ProductVersion)
+  $gatewayInfo = (Get-Item -LiteralPath (Join-Path $InstallDir 'Service\WindowsAdminCenter.exe')).VersionInfo
+  Set-JsonValue $json @("WindowsAdminCenter", "System", "FileVersion") $gatewayInfo.FileVersion
   $nuGetVersion = Get-WacAppSettingsNuGetVersion -AppSettings $json -Fallback "2.6.6"
+  if ($nuGetVersion -eq '0.0.0.0') {
+    $nuGetVersion = ([string]$gatewayInfo.ProductVersion -split '\+', 2)[0]
+    if ($nuGetVersion -notmatch '^\d+\.\d+\.\d+(?:[.-][\w.-]+)?$') { throw 'Unknown gateway package version.' }
+  }
   Set-JsonValue $json @("WindowsAdminCenter", "System", "NuGetVersion") $nuGetVersion
   Set-JsonValue $json @("WindowsAdminCenter", "FileSystem", "ProgramDataPath") $DataDir
   Set-JsonValue $json @("WindowsAdminCenter", "FileSystem", "ProgramFilesPath") $InstallDir
@@ -1132,8 +1176,12 @@ function Register-HttpSys {
 
   Write-Log "Registering HTTP.SYS for port $Port"
   Remove-HttpSysBinding -BindingPort $Port
-  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "add", "sslcert", "ipport=0.0.0.0:$Port", "certhash=$($Certificate.Thumbprint)", "appid=$script:AppId") -LogOutputOnSuccess:$false)
-  [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "add", "urlacl", "url=https://+:$Port/", "sddl=D:(A;;GX;;;NS)") -LogOutputOnSuccess:$false)
+  $binding = Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "add", "sslcert", "ipport=0.0.0.0:$Port", "certhash=$($Certificate.Thumbprint)", "appid=$script:AppId", "certstorename=MY") -LogOutputOnSuccess:$false
+  if ($binding.ExitCode -ne 0 -or (Get-WacHttpBindingHash $Port) -ne $Certificate.Thumbprint) {
+    throw "Failed to register the HTTP.SYS certificate on port $Port."
+  }
+  $reservation = Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "add", "urlacl", "url=https://+:$Port/", "sddl=D:(A;;GX;;;NS)") -LogOutputOnSuccess:$false
+  if ($reservation.ExitCode -ne 0) { throw "Failed to reserve the HTTP.SYS URL on port $Port." }
 }
 
 function Register-Firewall {
@@ -1360,7 +1408,11 @@ function Apply-WacSetupMarkerDefaults {
   if (-not $script:OriginalBoundParameters.ContainsKey("ServicePortEnd") -and $Marker.servicePortEnd) { Set-Variable -Name ServicePortEnd -Scope Script -Value ([int]$Marker.servicePortEnd) }
   if (-not $script:OriginalBoundParameters.ContainsKey("EndpointFqdn") -and $Marker.endpointFqdn) { Set-Variable -Name EndpointFqdn -Scope Script -Value ([string]$Marker.endpointFqdn) }
   if (-not $script:OriginalBoundParameters.ContainsKey("ServiceFqdn") -and $Marker.serviceFqdn) { Set-Variable -Name ServiceFqdn -Scope Script -Value ([string]$Marker.serviceFqdn) }
-  if (-not $script:OriginalBoundParameters.ContainsKey("CertificateThumbprint") -and $Marker.certificateThumbprint) { Set-Variable -Name CertificateThumbprint -Scope Script -Value ([string]$Marker.certificateThumbprint) }
+  if (-not $GenerateCertificate -and -not $script:OriginalBoundParameters.ContainsKey("CertificateThumbprint") -and $Marker.certificateThumbprint) {
+    if ((Get-WacMarkerCertificateSource $Marker) -eq 'Explicit') {
+      $script:CertificateThumbprint = [string]$Marker.certificateThumbprint
+    }
+  }
   if (-not $script:OriginalBoundParameters.ContainsKey("CertificateSubject") -and $Marker.certificateSubject) { Set-Variable -Name CertificateSubject -Scope Script -Value ([string]$Marker.certificateSubject) }
   if (-not $script:OriginalBoundParameters.ContainsKey("TrustSelfSignedCertificate") -and $Marker.trustSelfSignedCertificate) { Set-Variable -Name TrustSelfSignedCertificate -Scope Script -Value ([bool]$Marker.trustSelfSignedCertificate) }
   if (-not $script:OriginalBoundParameters.ContainsKey("SoftwareUpdateMode") -and $Marker.softwareUpdateMode) { Set-Variable -Name SoftwareUpdateMode -Scope Script -Value ([string]$Marker.softwareUpdateMode) }
@@ -1382,7 +1434,7 @@ function Write-WacSetupMarker {
   New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
   $markerPath = Get-WacSetupMarkerPath
   $marker = [ordered]@{
-    markerVersion = 1
+    markerVersion = 2
     installedBy = "wac-client-windows-setup"
     installedAt = (Get-Date).ToString("o")
     productVersion = $ProductVersion
@@ -1394,6 +1446,7 @@ function Write-WacSetupMarker {
     endpointFqdn = $EndpointFqdn
     serviceFqdn = $ServiceFqdn
     certificateThumbprint = $CertificateHash
+    certificateSource = if ($CertificateThumbprint) { 'Explicit' } else { 'Generated' }
     certificateSubject = Get-EffectiveCertificateSubject
     trustSelfSignedCertificate = [bool]$TrustSelfSignedCertificate
     softwareUpdateMode = $SoftwareUpdateMode
@@ -1406,7 +1459,7 @@ function Write-WacSetupMarker {
     keepExistingData = [bool]$KeepExistingData
     architectureOverride = [bool]$SkipArchitectureCheck
   }
-  $marker | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $markerPath -Encoding UTF8
+  Write-WacJsonAtomic $markerPath $marker
   Write-Log "Wrote setup marker: $markerPath"
 }
 
@@ -1423,6 +1476,7 @@ function Remove-WacFirewallRules {
 
 function Invoke-WacUninstall {
   Write-Log "Uninstalling Windows Admin Center" "STEP"
+  Remove-WacRenewalTask
   Stop-And-DeleteService $script:ServiceName
   Stop-And-DeleteService $script:AccountServiceName
   Unregister-UpdaterScheduledTask
@@ -1443,10 +1497,34 @@ function Invoke-WacUninstall {
   }
 }
 
+. (Join-Path $PSScriptRoot 'wac-certificate.ps1')
+
+$setupLock = $null
 try {
   Assert-Admin
 
+  if (($GenerateCertificate -and $CertificateThumbprint) -or (($RenewCertificate -or $ScheduledRenewal) -and ($Uninstall -or $GenerateCertificate -or $CertificateThumbprint -or $RefreshInstaller))) {
+    throw 'Conflicting certificate, uninstall, or upgrade options.'
+  }
+  if ($WhatIfPreference) {
+    [void]$PSCmdlet.ShouldProcess($DataDir, 'Apply the requested Windows Admin Center operation')
+    return
+  }
+  $setupLock = Enter-WacMaintenanceLock
+  if ($ScheduledRenewal) {
+    if ($PSCmdlet.ShouldProcess('Windows Admin Center', 'Check scheduled certificate renewal')) {
+      Invoke-WacScheduledRenewal
+    }
+    return
+  }
   $setupMarker = Read-WacSetupMarker -MarkerDataDir $DataDir
+  if ($RenewCertificate) {
+    if (-not $setupMarker) { throw 'Certificate recovery requires an existing WAC wrapper marker.' }
+    if ($PSCmdlet.ShouldProcess($DataDir, 'Renew the wrapper-managed WAC certificate')) {
+      Invoke-WacManualRenewal -Marker $setupMarker -EnginePath $PSCommandPath
+    }
+    return
+  }
   if ($setupMarker) {
     Apply-WacSetupMarkerDefaults -Marker $setupMarker
     $existingPreviousTrustedHosts = Get-WacMarkerValue -Marker $setupMarker -Name "previousTrustedHosts"
@@ -1469,6 +1547,18 @@ try {
 
   Test-TargetArchitecture
 
+  if ($RefreshInstaller) {
+    if ($InstallerPath -or $SkipExtraction) { throw '-RefreshInstaller requires a fresh online installer and extraction.' }
+    if (-not $setupMarker -and (Get-Service -Name $script:ServiceName -ErrorAction SilentlyContinue)) {
+      throw 'Cannot upgrade a running installation without its wrapper marker. Check -DataDir.'
+    }
+    if ($setupMarker -or (Test-Path -LiteralPath $DataDir)) { $KeepExistingData = $true }
+    $freshDir = Join-Path (Get-InstallerDownloadDirectory) ([guid]::NewGuid().ToString('N'))
+    $InstallerPath = Save-WacInstallerFromAkaMs -DownloadDir $freshDir
+    if (-not $InstallerPath) { throw 'A fresh Microsoft installer could not be downloaded.' }
+    if (-not $ExtractOut) { $ExtractOut = Join-Path $freshDir 'payload' }
+    if (Test-Path -LiteralPath $ExtractOut) { throw 'Refresh requires a new extraction directory.' }
+  }
   if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Get-DefaultInstallerPath }
   if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Get-CachedWacInstaller }
   if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Save-WacInstallerFromWinget }
@@ -1519,6 +1609,13 @@ try {
   if (-not (Test-Path -LiteralPath $payloadSvc)) {
     throw "Extracted payload is incomplete. Missing: $payloadSvc"
   }
+  $accountExe = Join-Path $payloadApp 'Service\WindowsAdminCenterAccountManagement.exe'
+  if (-not (Test-Path -LiteralPath $accountExe -PathType Leaf)) { throw "Missing Administration Mode service: $accountExe" }
+  $adminTemplate = Resolve-WacAdministrationTemplate -PayloadApp $payloadApp
+  # Validate an operator-supplied certificate before touching the running installation.
+  if ($CertificateThumbprint) {
+    Assert-SuppliedCertificateUsableForWac -Certificate (Get-Item -LiteralPath "Cert:\LocalMachine\My\$CertificateThumbprint")
+  }
 
   if ($PSCmdlet.ShouldProcess($InstallDir, "Install Windows Admin Center")) {
     Write-Log "Stopping/removing previous WAC services and bindings" "STEP"
@@ -1535,9 +1632,12 @@ try {
       Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     New-Item -ItemType Directory -Path $InstallDir, $DataDir -Force | Out-Null
-    Copy-DirectoryContents -Source $payloadApp -Destination $InstallDir
+    Copy-DirectoryContents -Source $payloadApp -Destination $InstallDir -Exclude 'Enterprise'
+    Copy-Item -LiteralPath $adminTemplate -Destination (Join-Path $InstallDir 'Service\appsettings.json') -Force
     if ((-not $KeepExistingData) -and (Test-Path -LiteralPath $payloadData)) {
       Copy-DirectoryContents -Source $payloadData -Destination $DataDir
+    } elseif ($KeepExistingData -and (Test-Path -LiteralPath (Join-Path $payloadData 'UX'))) {
+      Copy-DirectoryContents -Source (Join-Path $payloadData 'UX') -Destination (Join-Path $DataDir 'UX')
     }
     New-Item -ItemType Directory -Path (Join-Path $DataDir "Logs"), (Join-Path $DataDir "Database"), (Join-Path $DataDir "Updater") -Force | Out-Null
     New-Item -ItemType File -Path (Join-Path $DataDir "Logs\Configuration.log") -Force | Out-Null
@@ -1594,7 +1694,14 @@ try {
     }
 
     $productVersion = Get-InstallerProductVersion -Path $InstallerPath
+    $probeNames = if ($CertificateThumbprint) { @($EndpointFqdn, $ServiceFqdn) } else { Get-RequiredGeneratedCertificateDnsNames }
+    Assert-WacServedCertificate -Certificate $cert -Names $probeNames -Port $Port -AllowUntrustedRoot:(!$CertificateThumbprint -and !$TrustSelfSignedCertificate)
     Write-WacSetupMarker -ProductVersion $productVersion -CertificateHash $cert.Thumbprint
+    if ($CertificateThumbprint) {
+      Remove-WacRenewalTask
+    } else {
+      Register-WacRenewalTask -Marker (Read-WacSetupMarker) -EnginePath $PSCommandPath
+    }
   }
 
   Write-Host ""
@@ -1608,6 +1715,8 @@ try {
   Write-UserText "FailedLog" @($script:LogPath)
   Wait-IfRequested
   exit 1
+} finally {
+  if ($setupLock) { $setupLock.Dispose() }
 }
 
 

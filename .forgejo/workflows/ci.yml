@@ -1,0 +1,43 @@
+name: WAC portable checks
+
+on:
+  push:
+    branches: [main, 'codex/candidate-*']
+  workflow_dispatch:
+    inputs:
+      base_commit:
+        description: Full base commit SHA for the trusted candidate
+        required: true
+        type: string
+
+jobs:
+  prepare:
+    if: ${{ github.event.repository.private && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/codex/candidate-')) }}
+    runs-on: self-hosted
+    outputs:
+      base: ${{ steps.range.outputs.base }}
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: range
+        shell: bash
+        env:
+          BASE: ${{ inputs.base_commit || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BASE" || "$BASE" == 0000000000000000000000000000000000000000 ]]; then
+            BASE=$(git merge-base HEAD origin/main)
+          fi
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$BASE" HEAD
+          printf 'base=%s\n' "$BASE" >> "$GITHUB_OUTPUT"
+  portable:
+    needs: prepare
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@6e799b414b34b6a56fd059a767220ab3c538223e
+    with:
+      base_commit: ${{ needs.prepare.outputs.base }}
+      head_commit: ${{ github.sha }}
+      script_path: scripts/test-portable.ps1
+      runs_on: self-hosted
