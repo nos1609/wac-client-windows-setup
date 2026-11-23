@@ -34,6 +34,6 @@ The project uses SemVer in the `VERSION` file without a leading `v`; release git
 
 ## Verify a candidate across two repositories
 
-Develop in private Forgejo. Push the candidate to a `codex/candidate-*` branch. The workflow calls a SHA-pinned `fj-actions-common/pester-ci`, checks the commit range, runs the portable tests, and checks the ZIP contents and SHA256. For a manual run, supply the full ancestor SHA in `base_commit`. The runner must provide Bash, Node, pwsh 7.6+, and Pester 6.2+ as required by the common workflow.
+Develop in private Forgejo. Push the candidate to a branch with the `feature/` prefix. The workflow calls a SHA-pinned `fj-actions-common/pester-ci`, checks the commit range, runs the portable tests, and checks the ZIP contents and SHA256. For a manual run, supply the full ancestor SHA in `base_commit`. The runner must provide Bash, Node, pwsh 7.6+, and Pester 6.2+ as required by the common workflow.
 
 GitHub hosts public PRs, Dependabot, and Windows CI. Promote the same verified commit. Before publication, check the ancestry of both `main` branches. Compare their SHAs after promotion. Include commits accepted through GitHub PRs in the next private verification. Stop promotion if the branches diverge. Tagging and publishing a release ZIP require a separate decision.

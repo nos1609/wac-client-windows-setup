@@ -2,7 +2,7 @@ name: WAC portable checks
 
 on:
   push:
-    branches: [main, 'codex/candidate-*']
+    branches: [main, 'feature/**']
   workflow_dispatch:
     inputs:
       base_commit:
@@ -12,7 +12,7 @@ on:
 
 jobs:
   prepare:
-    if: ${{ github.event.repository.private && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/codex/candidate-')) }}
+    if: ${{ github.event.repository.private && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature/')) }}
     runs-on: self-hosted
     outputs:
       base: ${{ steps.range.outputs.base }}
