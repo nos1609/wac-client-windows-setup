@@ -59,7 +59,7 @@ jobs:
           first_push_base_ref: refs/remotes/origin/main
   portable:
     needs: prepare
-    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@2e2efbb3ba05593e5bf6ed644537b4e87fb9e924
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@c5384e404b95d58ca26814411bb654218ec2c3eb
     with:
       base_commit: ${{ needs.prepare.outputs.base }}
       head_commit: ${{ needs.prepare.outputs.head }}
@@ -99,10 +99,11 @@ jobs:
 
   review:
     needs: [prepare, portable, review_range]
-    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@2e2efbb3ba05593e5bf6ed644537b4e87fb9e924
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@c5384e404b95d58ca26814411bb654218ec2c3eb
     with:
       base_commit: ${{ needs.review_range.outputs.base }}
       expected_head_sha: ${{ needs.prepare.outputs.head }}
       workflow_id: ci.yml
       continue_on_error: false
+      process_timeout_seconds: "1020"
       upload_prompts: true
