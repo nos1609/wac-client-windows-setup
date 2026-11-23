@@ -92,7 +92,7 @@ Available fields: install directory, data directory, gateway HTTPS port, service
 
 When the wizard runs on ARM64, the first action screen shows a separate red warning. There is no ARM64 checkbox in custom setup: the interactive wizard adds `-SkipArchitectureCheck` automatically, while direct `wac-setup-engine.ps1` runs still require that switch explicitly.
 
-If WAC was already installed by this package, the wizard detects `C:\ProgramData\WindowsAdminCenter\wac-setup.json` and shows uninstall as the first action. Normal uninstall removes services, the scheduled task, HTTP.SYS binding, firewall rules, and program files, while keeping WAC data. Full uninstall also removes the WAC data directory and is highlighted as a risky action.
+If WAC was already installed by this package, the wizard reads the protected marker at `%ProgramFiles%\WacClientCertificateMaintenance\wac-setup.json` and shows uninstall as the first action. Normal uninstall removes services, the scheduled task, HTTP.SYS binding, firewall rules, and program files, while keeping WAC data. Full uninstall also removes the WAC data directory and is highlighted as a risky action. During upgrade or certificate recovery, setup checks the legacy installation path against the registered service and moves the marker out of the data directory.
 
 To upgrade an existing installation to the current Administration Mode, run `.\wac-setup-engine.ps1 -RefreshInstaller` in elevated PowerShell. This downloads a fresh Microsoft-signed EXE to a separate directory, extracts it there, and preserves data for an installation with a marker. The default path still supports offline setup from a local EXE or cache. The WAC 2611 installer (WinGet package 3.0.0.6) combines Administration Mode and Virtualization Mode. The wrapper configures the Administration Mode services.
 
@@ -363,4 +363,4 @@ Get-ScheduledTaskInfo -TaskName WacClientCertificateRenewal
 curl.exe --head https://localhost:6600
 ```
 
-For an operator-managed certificate, supply a new valid `-CertificateThumbprint` during setup with `-KeepExistingData`. For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If the certificate is still valid and Schannel reports `0x8009030D`, check private key access for `NETWORK SERVICE`.
+For an operator-managed certificate, the gateway must trust the certificate chain. Setup checks machine trust before it stops the services. Supply a new valid `-CertificateThumbprint` during setup with `-KeepExistingData`. For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If the certificate is still valid and Schannel reports `0x8009030D`, check private key access for `NETWORK SERVICE`.

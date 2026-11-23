@@ -791,10 +791,24 @@ function Assert-WacCodeAccess {
 }
 
 function Assert-WacInstallLayout {
+  $protectedTrees = @($env:SystemRoot, (Get-WacMaintenanceDirectory))
+  $reservedDirs = $protectedTrees + @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)
   $roots = foreach ($target in @($InstallDir,$DataDir)) {
     if ($target -notmatch '^[a-zA-Z]:\\' -or $target.Substring(2).Contains(':')) { throw "Expected a local drive path: $target" }
     $path = [IO.Path]::GetFullPath($target).TrimEnd('\')
     if ($path.Length -le 2) { throw 'A drive root cannot be a WAC installation directory.' }
+    foreach ($reserved in $reservedDirs) {
+      if (-not $reserved) { continue }
+      $reserved = [IO.Path]::GetFullPath($reserved).TrimEnd('\')
+      if ($path -eq $reserved -or $reserved.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cannot use a system or maintenance directory as a WAC target: $path"
+      }
+    }
+    foreach ($reserved in $protectedTrees) {
+      if ($path.StartsWith($reserved + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cannot place WAC inside a system or maintenance directory: $path"
+      }
+    }
     if (Test-Path -LiteralPath $path) { Assert-WacLocalPath $path }
     $parent = [IO.Directory]::GetParent($path)
     while ($null -ne $parent) {
@@ -829,7 +843,10 @@ function Set-WacDirectorySecurity {
 
 function Initialize-WacInstallationDirectories {
   $updater = Join-Path $DataDir 'Updater'
-  if (-not $KeepExistingData -and [IO.Directory]::Exists($DataDir)) { [IO.Directory]::Delete($DataDir, $true) }
+  if (-not $KeepExistingData -and [IO.Directory]::Exists($DataDir)) {
+    Assert-WacLocalPath $DataDir
+    [IO.Directory]::Delete($DataDir, $true)
+  }
   if (-not [IO.Directory]::Exists($DataDir)) { New-Item -ItemType Directory -Path $DataDir -ErrorAction Stop | Out-Null }
   Assert-WacLocalPath $DataDir
   Set-WacDirectorySecurity -Path $DataDir
@@ -1051,6 +1068,15 @@ function Assert-SuppliedCertificateUsableForWac {
   if (-not (Test-CertificateUsableForWac -Certificate $Certificate -RequiredDnsNames $requiredNames)) {
     throw "Supplied certificate $($Certificate.Thumbprint) does not cover required WAC names: $($requiredNames -join ', ')."
   }
+  # Match the post-install TLS probe: machine trust, server auth, no revocation lookup.
+  $chain = [Security.Cryptography.X509Certificates.X509Chain]::new($true)
+  try {
+    $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+    [void]$chain.ChainPolicy.ApplicationPolicy.Add([Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.1'))
+    if (-not $chain.Build($Certificate)) {
+      throw "Supplied certificate does not have a trusted server authentication chain: $($chain.ChainStatus.Status -join ', ')."
+    }
+  } finally { $chain.Dispose() }
 }
 
 function Write-CertificateDiagnostics {
@@ -1463,23 +1489,18 @@ function Test-TcpPort {
   }
 }
 
-function Get-WacSetupMarkerPath {
-  param([string]$MarkerDataDir = $DataDir)
-  return [System.IO.Path]::Combine($MarkerDataDir, "wac-setup.json")
-}
-
 function Read-WacSetupMarker {
   param([string]$MarkerDataDir = $DataDir)
 
-  $path = Get-WacSetupMarkerPath -MarkerDataDir $MarkerDataDir
+  $path = Get-WacReadableMarkerPath $MarkerDataDir
   if (-not (Test-Path -LiteralPath $path)) { return $null }
   try {
-    $marker = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-    if ($marker.installedBy -ne "wac-client-windows-setup") { return $null }
+    Assert-WacLocalPath $path
+    $marker = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($marker.installedBy -ne "wac-client-windows-setup") { throw 'Unexpected setup marker identity.' }
     return $marker
   } catch {
-    Write-Log ("Could not read setup marker {0}: {1}" -f $path, $_.Exception.Message) "WARN"
-    return $null
+    throw ("Could not read setup marker {0}: {1}" -f $path, $_.Exception.Message)
   }
 }
 
@@ -1492,6 +1513,25 @@ function Get-WacMarkerValue {
   if ($null -eq $Marker) { return $null }
   if ($Marker.PSObject.Properties.Name -notcontains $Name) { return $null }
   return $Marker.$Name
+}
+
+function Assert-WacMarkerDirectories {
+  param($Marker)
+  $recorded = [IO.Path]::GetFullPath($Marker.installDir).TrimEnd('\')
+  if ([IO.Path]::GetFullPath($Marker.dataDir).TrimEnd('\') -ne [IO.Path]::GetFullPath($DataDir).TrimEnd('\')) {
+    throw 'The WAC marker points outside the selected data directory.'
+  }
+  if ($script:OriginalBoundParameters.ContainsKey('InstallDir') -and [IO.Path]::GetFullPath($InstallDir).TrimEnd('\') -ne $recorded) {
+    throw 'The selected installation directory does not match the WAC marker.'
+  }
+  $installed = Get-CimInstance -ClassName Win32_Service -Filter "Name='WindowsAdminCenter'" -ErrorAction Stop
+  if ($installed) {
+    if ($installed.PathName.Trim('"') -ne [IO.Path]::Combine($recorded, 'Service', 'WindowsAdminCenter.exe')) {
+      throw 'The installation directory does not match the registered gateway service.'
+    }
+  } elseif (-not [IO.File]::Exists((Get-WacProtectedMarkerPath))) {
+    throw 'Cannot verify the legacy installation directory without the registered gateway service.'
+  }
 }
 
 function Apply-WacSetupMarkerDefaults {
@@ -1529,7 +1569,7 @@ function Write-WacSetupMarker {
   )
 
   New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
-  $markerPath = Get-WacSetupMarkerPath
+  $markerPath = Get-WacProtectedMarkerPath
   $marker = [ordered]@{
     markerVersion = 2
     installedBy = "wac-client-windows-setup"
@@ -1556,13 +1596,14 @@ function Write-WacSetupMarker {
     keepExistingData = [bool]$KeepExistingData
     architectureOverride = [bool]$SkipArchitectureCheck
   }
-  Write-WacJsonAtomic $markerPath $marker
+  Write-WacProtectedMarker $marker
   Write-Log "Wrote setup marker: $markerPath"
 }
 
 function Remove-WacSetupMarker {
-  $markerPath = Get-WacSetupMarkerPath
-  Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+  foreach ($path in @((Get-WacSetupMarkerPath $DataDir), (Get-WacProtectedMarkerPath))) {
+    if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+  }
 }
 
 function Remove-WacFirewallRules {
@@ -1573,6 +1614,8 @@ function Remove-WacFirewallRules {
 
 function Invoke-WacUninstall {
   Write-Log "Uninstalling Windows Admin Center" "STEP"
+  Assert-WacInstallLayout
+  Move-WacLegacyMarker -Marker $setupMarker
   Remove-WacRenewalTask
   Stop-And-DeleteService $script:ServiceName
   Stop-And-DeleteService $script:AccountServiceName
@@ -1583,15 +1626,21 @@ function Invoke-WacUninstall {
   Restore-WinRmTrustedHosts -PreviousValue $previousTrustedHosts
 
   Write-Log "Removing install directory: $InstallDir"
-  Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+  if ([IO.Directory]::Exists($InstallDir)) {
+    Assert-WacLocalPath $InstallDir
+    [IO.Directory]::Delete($InstallDir, $true)
+  }
 
   if ($PurgeData) {
     Write-Log "Removing WAC data directory: $DataDir" "WARN"
-    Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ([IO.Directory]::Exists($DataDir)) {
+      Assert-WacLocalPath $DataDir
+      [IO.Directory]::Delete($DataDir, $true)
+    }
   } else {
     Write-Log "Keeping WAC data directory: $DataDir"
-    Remove-WacSetupMarker
   }
+  Remove-WacSetupMarker
 }
 
 . (Join-Path $PSScriptRoot 'wac-certificate.ps1')
@@ -1615,6 +1664,9 @@ try {
     return
   }
   $setupMarker = Read-WacSetupMarker -MarkerDataDir $DataDir
+  if ($setupMarker) {
+    Assert-WacMarkerDirectories -Marker $setupMarker
+  }
   if ($RenewCertificate) {
     if (-not $setupMarker) { throw 'Certificate recovery requires an existing WAC wrapper marker.' }
     if ($PSCmdlet.ShouldProcess($DataDir, 'Renew the wrapper-managed WAC certificate')) {
@@ -1623,16 +1675,6 @@ try {
     return
   }
   if ($setupMarker) {
-    if ([IO.Path]::GetFullPath($setupMarker.dataDir).TrimEnd('\') -ne [IO.Path]::GetFullPath($DataDir).TrimEnd('\')) {
-      throw 'The WAC marker points outside the selected data directory.'
-    }
-    if ($RefreshInstaller) {
-      $installed = Get-CimInstance -ClassName Win32_Service -Filter "Name='WindowsAdminCenter'" -ErrorAction Stop
-      $selectedDir = if ($script:OriginalBoundParameters.ContainsKey('InstallDir')) { $InstallDir } else { $setupMarker.installDir }
-      if ($installed -and $installed.PathName.Trim('"') -ne (Join-Path $selectedDir 'Service\WindowsAdminCenter.exe')) {
-        throw 'The selected installation directory does not match the installed gateway.'
-      }
-    }
     Apply-WacSetupMarkerDefaults -Marker $setupMarker
     $existingPreviousTrustedHosts = Get-WacMarkerValue -Marker $setupMarker -Name "previousTrustedHosts"
     if ($null -ne $existingPreviousTrustedHosts) { $script:PreviousTrustedHosts = [string]$existingPreviousTrustedHosts }
@@ -1726,6 +1768,7 @@ try {
 
   if ($PSCmdlet.ShouldProcess($InstallDir, "Install Windows Admin Center")) {
     Assert-WacInstallLayout
+    Move-WacLegacyMarker -Marker $setupMarker
     Write-Log "Stopping/removing previous WAC services and bindings" "STEP"
     Stop-And-DeleteService $script:ServiceName
     Stop-And-DeleteService $script:AccountServiceName

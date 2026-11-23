@@ -33,11 +33,6 @@ function New-WacTuiConfig {
   }
 }
 
-function Get-WacSetupMarkerPath {
-  param([string]$DataDir = "$env:ProgramData\WindowsAdminCenter")
-  return [System.IO.Path]::Combine($DataDir, "wac-setup.json")
-}
-
 function ConvertFrom-WacSetupMarker {
   param([Parameter(Mandatory = $true)]$Marker)
 
@@ -70,13 +65,14 @@ function Get-WacTuiInstallState {
     [string]$InstallDir = "$env:ProgramFiles\WindowsAdminCenter"
   )
 
-  $markerPath = Get-WacSetupMarkerPath -DataDir $DataDir
+  $markerPath = Get-WacReadableMarkerPath $DataDir
   $config = New-WacTuiConfig
   $isInstalledByThisSetup = $false
   if (Test-Path -LiteralPath $markerPath) {
     try {
       $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
-      if ($marker.installedBy -eq "wac-client-windows-setup") {
+      if ($marker.installedBy -eq "wac-client-windows-setup" -and
+          ($markerPath -eq (Get-WacProtectedMarkerPath) -or $marker.dataDir -eq $DataDir)) {
         $config = ConvertFrom-WacSetupMarker -Marker $marker
         $isInstalledByThisSetup = $true
       }

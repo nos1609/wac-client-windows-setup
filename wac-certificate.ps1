@@ -30,6 +30,22 @@ function Get-WacMaintenanceDirectory {
   return [IO.Path]::Combine($parent, 'WacClientCertificateMaintenance')
 }
 
+function Get-WacSetupMarkerPath {
+  param([string]$DataDir = "$env:ProgramData\WindowsAdminCenter")
+  return [IO.Path]::Combine($DataDir, 'wac-setup.json')
+}
+
+function Get-WacProtectedMarkerPath {
+  return [IO.Path]::Combine((Get-WacMaintenanceDirectory), 'wac-setup.json')
+}
+
+function Get-WacReadableMarkerPath {
+  param([string]$DataDir)
+  $protected = Get-WacProtectedMarkerPath
+  if ([IO.File]::Exists($protected)) { return $protected }
+  return Get-WacSetupMarkerPath $DataDir
+}
+
 function Assert-WacLocalPath {
   param([Parameter(Mandatory = $true)][string]$Path)
   if ($Path -notmatch '^[A-Za-z]:\\' -or $Path.Substring(2).Contains(':')) {
@@ -129,17 +145,59 @@ function Assert-WacServedCertificate {
   }
 }
 
-function Register-WacRenewalTask {
-  param($Marker, [string]$EnginePath)
-  if (-not $Marker -or (Get-WacMarkerCertificateSource $Marker) -ne 'Generated') {
-    throw 'Scheduled renewal requires a wrapper-managed certificate.'
+function Grant-WacMarkerReadAccess {
+  param([string]$Path)
+  # The unelevated wizard reads this file. Its parent only permits trusted writers.
+  $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+  $readers = [Security.Principal.SecurityIdentifier]::new('S-1-5-11')
+  $acl.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new($readers, 'Read', 'Allow'))
+  Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+}
+
+function Write-WacProtectedMarker {
+  param($Marker)
+  $path = Get-WacProtectedMarkerPath
+  Write-WacJsonAtomic $path $Marker
+  Grant-WacMarkerReadAccess $path
+  $legacy = Get-WacSetupMarkerPath $Marker.dataDir
+  if ([IO.File]::Exists($legacy) -and [IO.Path]::GetFullPath($legacy) -ne $path) {
+    Assert-WacLocalPath $Marker.dataDir
+    [IO.File]::Delete($legacy)
   }
+}
+
+function Move-WacLegacyMarker {
+  param($Marker)
+  # Keep a verified installation record if setup stops after deleting the service.
+  if ($Marker -and -not [IO.File]::Exists((Get-WacProtectedMarkerPath))) {
+    Write-WacProtectedMarker $Marker
+  }
+}
+
+function Install-WacRenewalScripts {
+  param([string]$EnginePath)
   $dir = Get-WacMaintenanceDirectory
   $installedEngine = Join-Path $dir 'wac-setup-engine.ps1'
   if ([IO.Path]::GetFullPath($EnginePath) -ne $installedEngine) {
     Copy-Item -LiteralPath $EnginePath -Destination $installedEngine -Force
     Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $EnginePath) 'wac-certificate.ps1') -Destination $dir -Force
   }
+  foreach ($scriptName in @('wac-setup-engine.ps1', 'wac-certificate.ps1')) {
+    $installedScript = Join-Path $dir $scriptName
+    Assert-WacLocalPath $installedScript
+    Assert-WacCodeAccess $installedScript
+    Unblock-File -LiteralPath $installedScript -ErrorAction Stop
+  }
+  return $installedEngine
+}
+
+function Register-WacRenewalTask {
+  param($Marker, [string]$EnginePath)
+  if (-not $Marker -or (Get-WacMarkerCertificateSource $Marker) -ne 'Generated') {
+    throw 'Scheduled renewal requires a wrapper-managed certificate.'
+  }
+  $dir = Get-WacMaintenanceDirectory
+  $installedEngine = Install-WacRenewalScripts -EnginePath $EnginePath
   Write-WacJsonAtomic (Join-Path $dir 'settings.json') $Marker
   $journal = Join-Path $dir 'rotation.json'
   if (Test-Path -LiteralPath $journal) { Remove-Item -LiteralPath $journal -Force }
@@ -259,7 +317,7 @@ function Invoke-WacCertificateRotation {
   $WinRmHttpsMode = [string]$State.winRmHttpsMode
   $trust = [bool]$State.trustSelfSignedCertificate
   $port = [int]$State.port
-  $markerPath = Join-Path $State.dataDir 'wac-setup.json'
+  $markerPath = Get-WacReadableMarkerPath $State.dataDir
   $settingsPath = Join-Path $State.installDir 'Service\appsettings.json'
   Assert-WacLocalPath $markerPath
   Assert-WacLocalPath $settingsPath
@@ -268,6 +326,9 @@ function Invoke-WacCertificateRotation {
     throw 'Renewal state does not match the installed gateway service.'
   }
   $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+  if ($marker.dataDir -ne $State.dataDir -or $marker.installDir -ne $State.installDir) {
+    throw 'The WAC marker directories do not match the renewal state.'
+  }
   if ($marker.installedBy -ne $State.installedBy -or (Get-WacMarkerCertificateSource $marker) -ne 'Generated') {
     throw 'The gateway certificate is no longer managed by the wrapper.'
   }
@@ -307,11 +368,11 @@ function Invoke-WacCertificateRotation {
     if ($trust) { Ensure-TrustedCertificate $current }
     Assert-WacServedCertificate $current $names $port -AllowUntrustedRoot:(!$trust)
     $State | Add-Member certificateSource 'Generated' -Force
-    if ($marker.markerVersion -lt 2 -or $marker.trustSelfSignedCertificate -ne $trust) {
+    if ($markerPath -ne (Get-WacProtectedMarkerPath) -or $marker.markerVersion -lt 2 -or $marker.trustSelfSignedCertificate -ne $trust) {
       $marker.markerVersion = $State.markerVersion = 2
       $marker | Add-Member certificateSource 'Generated' -Force
       $marker | Add-Member trustSelfSignedCertificate $trust -Force
-      Write-WacJsonAtomic $markerPath $marker
+      Write-WacProtectedMarker $marker
     }
     return
   }
@@ -372,7 +433,7 @@ function Invoke-WacCertificateRotation {
     $record | Add-Member trustSelfSignedCertificate $trust -Force
     $record.markerVersion = 2
   }
-  Write-WacJsonAtomic $markerPath $marker
+  Write-WacProtectedMarker $marker
   Write-WacJsonAtomic (Join-Path $dir 'settings.json') $State
   Remove-Item -LiteralPath $pendingPath -Force
   Write-Log ("Renewed WAC certificate, expires {0:o}" -f $next.NotAfter)

@@ -30,6 +30,57 @@ Describe 'WAC certificate maintenance' {
     Assert-FailsWith { Assert-SuppliedCertificateUsableForWac $cert } 'outside its validity period'
   }
 
+  Context 'Supplied certificates and legacy markers' {
+    It 'rejects an untrusted operator certificate even when its key and names are usable' {
+      $rsa = if ($env:OS -eq 'Windows_NT') {
+        [Security.Cryptography.RSACng]::new(2048)
+      } else { [Security.Cryptography.RSA]::Create(2048) }
+      $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+        'CN=localhost', $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+      $cert = $request.CreateSelfSigned([DateTimeOffset]::Now.AddHours(-1), [DateTimeOffset]::Now.AddHours(1))
+      Mock Test-CertificateHasUsablePrivateKey { $true }
+      Mock Test-CertificateHasServerAuthentication { $true }
+      Mock Test-CertificateUsableForWac { $true }
+      try {
+        Assert-FailsWith { Assert-SuppliedCertificateUsableForWac $cert } 'trusted server authentication chain'
+      } finally { $cert.Dispose(); $rsa.Dispose() }
+    }
+
+    It 'prefers the protected marker after migrating legacy state' {
+      $data = Join-Path $TestDrive 'old-data'
+      $safe = Join-Path $TestDrive 'protected'
+      $null = New-Item -ItemType Directory -Path $data,$safe -Force
+      Mock Get-WacMaintenanceDirectory { $safe }
+      Mock Assert-WacLocalPath {}
+      Mock Grant-WacMarkerReadAccess {}
+      $old = Join-Path $data 'wac-setup.json'
+      Write-WacJsonAtomic $old @{dataDir=$data; port=6600}
+      (Get-WacReadableMarkerPath $data) | Should -Be $old
+      Write-WacProtectedMarker ([pscustomobject]@{dataDir=$data; port=7443})
+      (Test-Path -LiteralPath $old) | Should -Be $false
+      Write-WacJsonAtomic $old @{dataDir=$data; port=8080}
+      $selected = Get-WacReadableMarkerPath $data
+      $selected | Should -Be (Join-Path $safe 'wac-setup.json')
+      (Get-Content -LiteralPath $selected -Raw | ConvertFrom-Json).port | Should -Be 7443
+    }
+
+    It 'rejects an unverified legacy removal path before touching the installation' {
+      if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        function Get-CimInstance { param($ClassName,$Filter) }
+      }
+      $DataDir = Join-Path $TestDrive 'data'
+      $marker = [pscustomobject]@{installDir=(Join-Path $TestDrive 'other'); dataDir=$DataDir}
+      $script:OriginalBoundParameters = @{}
+      Mock Get-WacProtectedMarkerPath { Join-Path $TestDrive 'missing.json' }
+      Mock Get-CimInstance { [pscustomobject]@{PathName=[IO.Path]::Combine($TestDrive,'program','Service','WindowsAdminCenter.exe')} }
+      Assert-FailsWith { Assert-WacMarkerDirectories $marker } 'registered gateway service'
+      $marker.installDir = Join-Path $TestDrive 'program'
+      Assert-WacMarkerDirectories $marker
+      Mock Get-CimInstance { $null }
+      Assert-FailsWith { Assert-WacMarkerDirectories $marker } 'without the registered gateway service'
+    }
+  }
+
   It 'classifies a legacy wrapper certificate even when it has expired' {
     Mock Get-Item { [pscustomobject]@{ Issuer='CN=test'; Subject='CN=test'; FriendlyName='Windows Admin Center Self-Signed Certificate'; Extensions=@([Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($false,$false,0,$true)) } } -ParameterFilter { $LiteralPath -like 'Cert:*' }
     $marker = [pscustomobject]@{ certificateThumbprint=('A'*40) }
@@ -139,24 +190,26 @@ Describe 'WAC certificate maintenance' {
     ((Get-WacUnsafeAccessMask $TestDrive) -band 0x156) | Should -Be 0x156
   }
 
-  It 'rebuilds legacy code trees while preserving the database on upgrade' {
-    $InstallDir = Join-Path $TestDrive 'program'
-    $DataDir = Join-Path $TestDrive 'data'
-    $updater = Join-Path $DataDir 'Updater'
-    $database = Join-Path $DataDir 'Database'
-    $KeepExistingData = $true
-    $null = New-Item -ItemType Directory -Path $updater,$database,$InstallDir -Force
-    foreach ($dir in @($updater,$InstallDir)) { [IO.File]::WriteAllText((Join-Path $dir 'old.dll'),'obsolete') }
-    $saved = Join-Path $database 'saved.txt'
-    [IO.File]::WriteAllText($saved,'saved connection')
-    Mock Assert-WacLocalPath {}
-    Mock Set-WacDirectorySecurity {}
-    Mock Assert-WacCodeAccess {}
-    Initialize-WacInstallationDirectories
-    [IO.File]::ReadAllText($saved) | Should -Be 'saved connection'
-    foreach ($dir in @($updater,$InstallDir)) {
-      (Test-Path -LiteralPath $dir -PathType Container) | Should -Be $true
-      (Test-Path -LiteralPath (Join-Path $dir 'old.dll')) | Should -Be $false
+  Context 'Upgrade directory fixtures' {
+    It 'rebuilds legacy code trees while preserving the database on upgrade' {
+      $InstallDir = Join-Path $TestDrive 'program'
+      $DataDir = Join-Path $TestDrive 'data'
+      $updater = Join-Path $DataDir 'Updater'
+      $database = Join-Path $DataDir 'Database'
+      $KeepExistingData = $true
+      $null = New-Item -ItemType Directory -Path $updater,$database,$InstallDir -Force
+      foreach ($dir in @($updater,$InstallDir)) { [IO.File]::WriteAllText((Join-Path $dir 'old.dll'),'obsolete') }
+      $saved = Join-Path $database 'saved.txt'
+      [IO.File]::WriteAllText($saved,'saved connection')
+      Mock Assert-WacLocalPath {}
+      Mock Set-WacDirectorySecurity {}
+      Mock Assert-WacCodeAccess {}
+      Initialize-WacInstallationDirectories
+      [IO.File]::ReadAllText($saved) | Should -Be 'saved connection'
+      foreach ($dir in @($updater,$InstallDir)) {
+        (Test-Path -LiteralPath $dir -PathType Container) | Should -Be $true
+        (Test-Path -LiteralPath (Join-Path $dir 'old.dll')) | Should -Be $false
+      }
     }
   }
 
@@ -182,6 +235,30 @@ Describe 'WAC certificate maintenance' {
       [IO.File]::WriteAllText($exe,'fixture')
       Assert-WacExecutableTree $codeDir
       (Get-Acl -LiteralPath $codeDir).AreAccessRulesProtected | Should -Be $true
+    }
+    Mock Get-WacMaintenanceDirectory { $InstallDir }
+    $legacy = Join-Path $DataDir 'wac-setup.json'
+    Write-WacJsonAtomic $legacy @{dataDir=$DataDir}
+    $marker = [pscustomobject]@{dataDir=$DataDir; port=6600}
+    Write-WacProtectedMarker $marker
+    $marker.port = 7443
+    Write-WacProtectedMarker $marker
+    Assert-WacCodeAccess (Get-WacProtectedMarkerPath)
+    (Test-Path -LiteralPath $legacy) | Should -Be $false
+    $source = Join-Path $TestDrive 'download'
+    $null = New-Item -ItemType Directory -Path $source
+    foreach ($name in @('wac-setup-engine.ps1', 'wac-certificate.ps1')) {
+      $file = Join-Path $source $name
+      Set-Content -LiteralPath $file -Value '# fixture'
+      Set-Content -LiteralPath $file -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+    }
+    $entry = Install-WacRenewalScripts (Join-Path $source 'wac-setup-engine.ps1')
+    $entry | Should -Be (Join-Path $InstallDir 'wac-setup-engine.ps1')
+    foreach ($name in @('wac-setup-engine.ps1', 'wac-certificate.ps1')) {
+      $dest = Join-Path $InstallDir $name
+      (Get-FileHash -LiteralPath $dest).Hash | Should -Be (Get-FileHash -LiteralPath (Join-Path $source $name)).Hash
+      @(Get-Item -LiteralPath $dest -Stream Zone.Identifier -ErrorAction SilentlyContinue).Count | Should -Be 0
+      @(Get-Item -LiteralPath (Join-Path $source $name) -Stream Zone.Identifier).Count | Should -Be 1
     }
     Assert-WacCodeAccess $DataDir -Ancestor
     $dbFile = Join-Path $db 'connection.db'
@@ -263,6 +340,8 @@ Describe 'WAC certificate maintenance' {
         certificateThumbprint=$oldHash; certificateSubject='WACTest'; trustSelfSignedCertificate=$true
         winRmHttpsMode='Disable'; productVersion='2.6.6.18'
       }
+      $script:safeDir = Join-Path $fixture 'private'
+      $null = New-Item -ItemType Directory -Path $safeDir
       $script:markerPathTest = Join-Path $fixture 'wac-setup.json'
       Write-WacJsonAtomic $markerPathTest $state
       $block = @{ Subject='WACTest'; Thumbprint=$oldHash }
@@ -272,7 +351,9 @@ Describe 'WAC certificate maintenance' {
         WindowsAdminCenter=@{ServiceCertificate=$block}; preserve='unrelated setting'
       }
       Mock Assert-WacLocalPath {}
-      Mock Get-WacMaintenanceDirectory { $fixture }
+      Mock Get-WacMaintenanceDirectory { $script:safeDir }
+      Mock Get-WacProtectedMarkerPath { Join-Path $script:safeDir 'wac-setup.json' }
+      Mock Grant-WacMarkerReadAccess {}
       Mock Get-CimInstance { [pscustomobject]@{PathName=(Join-Path $fixture 'Service/WindowsAdminCenter.exe')} }
       Mock Get-Item {
         [pscustomobject]@{ Issuer='CN=WACTest'; Subject='CN=WACTest'; FriendlyName='Windows Admin Center Self-Signed Certificate'
@@ -291,7 +372,7 @@ Describe 'WAC certificate maintenance' {
     It 'rotates a v1 installation, verifies the new endpoint and persists both bindings' {
       Invoke-WacCertificateRotation $state
       $conf = Get-Content -LiteralPath $confPathTest -Raw | ConvertFrom-Json
-      $marker = Get-Content -LiteralPath $markerPathTest -Raw | ConvertFrom-Json
+      $marker = Get-Content -LiteralPath (Get-WacProtectedMarkerPath) -Raw | ConvertFrom-Json
       $marker.certificateSource | Should -Be 'Generated'
       $marker.certificateThumbprint | Should -Be $newHash
       $marker.productVersion | Should -Be '2.6.6.18'
@@ -303,7 +384,7 @@ Describe 'WAC certificate maintenance' {
       ($probes -contains 'localhost') | Should -Be $true
       ($probes -contains 'gateway.example.test') | Should -Be $true
       $restarts | Should -Be 1
-      (Test-Path -LiteralPath (Join-Path $fixture 'rotation.json')) | Should -Be $false
+      (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $false
     }
     It 'renews the gateway without accessing a WinRM listener excluded at setup' {
       $state.winRmHttpsMode = 'Enable'

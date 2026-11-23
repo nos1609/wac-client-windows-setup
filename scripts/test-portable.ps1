@@ -33,6 +33,7 @@ try {
   $expectedFiles = @('install-wac.cmd','interactive-installer.ps1','wac-setup-engine.ps1','wac-certificate.ps1',
     'LICENSE','VERSION','README.md','README.en.md','NOTICE.md','NOTICE.en.md','SECURITY.md','SECURITY.en.md',
     'tui/WacTui.Locale.ps1','tui/WacTui.Model.ps1','tui/WacTui.Progress.ps1','tui/WacTui.Render.ps1','tui/WacTui.Validation.ps1')
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
   $archive = [IO.Compression.ZipFile]::OpenRead($zip)
   try {
     $files = @($archive.Entries | Where-Object Name | ForEach-Object { $_.FullName.Replace('\','/') })
