@@ -407,4 +407,4 @@ If the setup log in `C:\WAC-Diag` reports `No certificate private key ACL was ch
 
 A `True` result from `Test-NetConnection` confirms that a TCP listener accepted the connection. The HTTPS check verifies the gateway certificate and returns the HTTP response headers.
 
-For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If setup cannot read the marker or its `installedBy` field identifies another package, setup exits before stopping WAC services or removing installation directories. Check the data directory path and confirm which package owns the installation.
+For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If setup cannot read the marker or its `installedBy` field identifies another package, setup exits before stopping WAC services or removing installation directories. The wizard shows the marker path before requesting administrator access. Check the data directory, the package that owns the installation, and read access to the file.

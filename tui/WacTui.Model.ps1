@@ -65,26 +65,32 @@ function Get-WacTuiInstallState {
     [string]$InstallDir = "$env:ProgramFiles\WindowsAdminCenter"
   )
 
-  $markerPath = Get-WacReadableMarkerPath $DataDir
+  $protectedPath = Get-WacProtectedMarkerPath
+  $markerPath = $protectedPath
   $config = New-WacTuiConfig
-  $isInstalledByThisSetup = $false
-  if (Test-Path -LiteralPath $markerPath) {
-    try {
-      $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
-      if ($marker.installedBy -eq "wac-client-windows-setup" -and
-          ($markerPath -eq (Get-WacProtectedMarkerPath) -or $marker.dataDir -eq $DataDir)) {
+  $markerStatus = 'Absent'
+  try {
+    $markerPath = Get-WacReadableMarkerPath -DataDir $DataDir -ProtectedPath $protectedPath
+    $marker = Read-WacSetupMarker -Path $markerPath
+    if ($null -ne $marker) {
+      $useRecordedDir = $markerPath -eq $protectedPath -and -not $PSBoundParameters.ContainsKey('DataDir')
+      if ($useRecordedDir -or
+          [IO.Path]::GetFullPath($marker.dataDir).TrimEnd('\') -eq [IO.Path]::GetFullPath($DataDir).TrimEnd('\')) {
         $config = ConvertFrom-WacSetupMarker -Marker $marker
-        $isInstalledByThisSetup = $true
+        $markerStatus = 'Valid'
+      } else {
+        $markerStatus = 'Invalid'
       }
-    } catch {
-      $isInstalledByThisSetup = $false
     }
+  } catch {
+    $markerStatus = 'Invalid'
   }
 
   $service = Get-Service -Name WindowsAdminCenter -ErrorAction SilentlyContinue
   $exePath = Join-Path $InstallDir "Service\WindowsAdminCenter.exe"
   return [pscustomobject]@{
-    IsInstalledByThisSetup = $isInstalledByThisSetup
+    IsInstalledByThisSetup = $markerStatus -eq 'Valid'
+    MarkerStatus = $markerStatus
     IsWacPresent = [bool]($service -or (Test-Path -LiteralPath $exePath))
     MarkerPath = $markerPath
     Config = $config

@@ -1489,20 +1489,6 @@ function Test-TcpPort {
   }
 }
 
-function Read-WacSetupMarker {
-  param([string]$Path = (Get-WacReadableMarkerPath $DataDir))
-
-  if (-not (Test-Path -LiteralPath $path)) { return $null }
-  try {
-    Assert-WacLocalPath $path
-    $marker = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    if ($marker.installedBy -ne "wac-client-windows-setup") { throw 'Unexpected setup marker identity.' }
-    return $marker
-  } catch {
-    throw ("Could not read setup marker {0}: {1}" -f $path, $_.Exception.Message)
-  }
-}
-
 function Get-WacMarkerValue {
   param(
     [AllowNull()]$Marker,

@@ -40,10 +40,23 @@ function Get-WacProtectedMarkerPath {
 }
 
 function Get-WacReadableMarkerPath {
-  param([string]$DataDir)
-  $protected = Get-WacProtectedMarkerPath
-  if ([IO.File]::Exists($protected)) { return $protected }
+  param([string]$DataDir, [string]$ProtectedPath = (Get-WacProtectedMarkerPath))
+  if (Test-Path -LiteralPath $ProtectedPath -ErrorAction Stop) { return $ProtectedPath }
   return Get-WacSetupMarkerPath $DataDir
+}
+
+function Read-WacSetupMarker {
+  param([string]$Path = (Get-WacReadableMarkerPath $DataDir))
+
+  try {
+    if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) { return $null }
+    Assert-WacLocalPath $Path
+    $marker = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($marker.installedBy -ne "wac-client-windows-setup") { throw 'Unexpected setup marker identity.' }
+    return $marker
+  } catch {
+    throw ("Could not read setup marker {0}: {1}" -f $Path, $_.Exception.Message)
+  }
 }
 
 function Assert-WacLocalPath {

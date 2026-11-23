@@ -112,6 +112,62 @@ Describe 'WAC certificate maintenance' {
     }
   }
 
+  Context 'Wizard marker checks' {
+    BeforeAll {
+      . (Join-Path $root 'interactive-installer.ps1')
+      if (-not (Get-Command Get-Service -ErrorAction SilentlyContinue)) {
+        function Get-Service { param($Name) }
+      }
+    }
+    BeforeEach {
+      $fixture = New-Item -ItemType Directory -Path (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))
+      $data = $fixture.FullName
+      $protected = Join-Path $data 'protected.json'
+      $legacy = Join-Path $data 'wac-setup.json'
+      Mock Get-WacProtectedMarkerPath { $protected }
+      Mock Get-Service { $null }
+      Mock Assert-WacLocalPath {}
+    }
+    It 'distinguishes absent, owned and conflicting legacy markers' {
+      (Get-WacTuiInstallState -DataDir $data).MarkerStatus | Should -Be 'Absent'
+      Write-WacJsonAtomic $legacy @{installedBy='wac-client-windows-setup'; dataDir=$data; port=7443}
+      $state = Get-WacTuiInstallState -DataDir $data
+      $state.MarkerStatus | Should -Be 'Valid'
+      $state.Config.Port | Should -Be 7443
+      Write-WacJsonAtomic $legacy @{installedBy='wac-client-windows-setup'; dataDir=(Join-Path $data 'other')}
+      (Get-WacTuiInstallState -DataDir $data).MarkerStatus | Should -Be 'Invalid'
+    }
+    It 'adopts the protected data directory and rejects a conflicting custom selection' {
+      Write-WacJsonAtomic $protected @{installedBy='wac-client-windows-setup'; dataDir=$data; port=7443}
+      $state = Get-WacTuiInstallState
+      $state.MarkerStatus | Should -Be 'Valid'
+      $state.Config.DataDir | Should -Be $data
+      (Get-WacTuiInstallState -DataDir $data).MarkerStatus | Should -Be 'Valid'
+      (Get-WacTuiInstallState -DataDir (Join-Path $data 'other')).MarkerStatus | Should -Be 'Invalid'
+    }
+    It 'blocks a foreign protected marker before the wizard offers actions' {
+      Write-WacJsonAtomic $protected @{installedBy='another-package'}
+      Mock Get-WacTuiCurrentPlatformRisk { throw 'Wizard advanced past marker check' }
+      Assert-FailsWith { Start-WacTuiWizard } $protected
+    }
+    It 'blocks an unreadable protected marker even when a valid legacy marker exists' {
+      Write-WacJsonAtomic $legacy @{installedBy='wac-client-windows-setup'; dataDir=$data}
+      Write-WacJsonAtomic $protected @{installedBy='wac-client-windows-setup'; dataDir=$data}
+      Mock Get-Content { throw 'Access denied' } -ParameterFilter { $LiteralPath -eq $protected }
+      $state = Get-WacTuiInstallState -DataDir $data
+      $state.MarkerStatus | Should -Be 'Invalid'
+      $state.MarkerPath | Should -Be $protected
+    }
+    It 'reports a malformed marker in the selected directory before launching setup' {
+      [IO.File]::WriteAllText($legacy, '{')
+      $config = New-WacTuiConfig
+      $config.DataDir = $data
+      $config.Language = 'En'
+      Mock Get-WacTuiWindowsPowerShellPath { throw 'Wizard started building a process plan' }
+      Assert-FailsWith { Invoke-WacTuiApply -Config $config } $legacy
+    }
+  }
+
   Context 'Final gateway verification' {
     It 'records the installed certificate and renewal mode before a failing TLS check (<mode>)' -TestCases @(
       @{mode='Generated'}, @{mode='Explicit'}
