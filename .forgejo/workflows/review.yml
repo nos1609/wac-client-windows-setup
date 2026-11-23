@@ -26,12 +26,14 @@ jobs:
           IS_PRIVATE: ${{ github.event.repository.private }}
           CANDIDATE_REF: ${{ github.ref }}
           EVENT_HEAD: ${{ github.sha }}
+          BASE: ${{ inputs.base_commit }}
           EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
         run: |
           set -euo pipefail
           [[ "${IS_PRIVATE,,}" == true ]]
           [[ "$CANDIDATE_REF" == refs/heads/main || "$CANDIDATE_REF" == refs/heads/feature/* ]]
           [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ && "$EXPECTED_HEAD" == "$EVENT_HEAD" ]]
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$BASE" != 0000000000000000000000000000000000000000 && "$BASE" != "$EXPECTED_HEAD" ]]
 
   portable:
     needs: prepare
@@ -49,4 +51,4 @@ jobs:
       expected_head_sha: ${{ inputs.expected_head_sha }}
       workflow_id: review.yml
       continue_on_error: false
-      upload_prompts: false
+      upload_prompts: true

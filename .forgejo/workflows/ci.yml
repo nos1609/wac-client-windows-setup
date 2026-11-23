@@ -105,4 +105,4 @@ jobs:
       expected_head_sha: ${{ needs.prepare.outputs.head }}
       workflow_id: ci.yml
       continue_on_error: false
-      upload_prompts: false
+      upload_prompts: true

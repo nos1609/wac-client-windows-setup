@@ -348,19 +348,38 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -
 
 ### Recover and renew the gateway certificate
 
-If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate that the gateway serves. For an existing wrapper installation, open PowerShell as administrator and run:
+If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate that the gateway serves. Open PowerShell as administrator. Use the recovery command for the certificate source. Add `-DataDir` if the installation uses a custom data directory.
+
+**Wrapper-managed certificate.** Run the renewal command.
 
 ```powershell
 .\wac-setup-engine.ps1 -RenewCertificate
 ```
 
-Add `-DataDir` for a custom data directory. Recovery checks the thumbprints in the marker, both WAC settings, the HTTP.SYS binding, and the WinRM HTTPS listener if the wrapper configured it. With seven days or less left, it rotates the certificate, restarts the gateway, and verifies the new thumbprint over TLS for the gateway names, including `localhost`. A failed probe restores the previous bindings. The previous certificate stays in the store.
+Recovery checks the thumbprints in the marker, both WAC settings, the HTTP.SYS binding, and the WinRM HTTPS listener if the wrapper configured it. With seven days or less left, it rotates the certificate, restarts the gateway, and verifies the new thumbprint over TLS for the gateway names, including `localhost`. A failed probe restores the previous bindings. The previous certificate stays in the store.
 
-Installation or recovery of a wrapper-managed certificate registers the daily `WacClientCertificateRenewal` task. The task can start and finish on battery power. A missed run starts when possible. To trust the new certificate on the gateway PC, add `-TrustSelfSignedCertificate` to the recovery command. Remote clients that trust the individual self-signed certificate must trust the new thumbprint after rotation. Check the task and TLS with:
+Installation or recovery of a wrapper-managed certificate registers the daily `WacClientCertificateRenewal` task. The task can start and finish on battery power. A missed run starts when possible. To trust the new certificate on the gateway PC, add `-TrustSelfSignedCertificate` to the recovery command. Remote clients that trust the individual self-signed certificate must trust the new thumbprint after rotation. Use `Get-ScheduledTaskInfo` to check the last run.
 
 ```powershell
 Get-ScheduledTaskInfo -TaskName WacClientCertificateRenewal
-curl.exe --head https://localhost:6600
 ```
 
-For an operator-managed certificate, the gateway must trust the certificate chain. Setup checks machine trust before it stops the services. Supply a new valid `-CertificateThumbprint` during setup with `-KeepExistingData`. For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If the certificate is still valid and Schannel reports `0x8009030D`, check private key access for `NETWORK SERVICE`.
+**Operator-managed certificate.** Install the replacement certificate and its private key in `Cert:\LocalMachine\My`. The gateway must trust its chain. Replace `<THUMBPRINT>` with the new certificate's 40-digit hexadecimal thumbprint and reinstall WAC while preserving its data.
+
+```powershell
+.\wac-setup-engine.ps1 -KeepExistingData -CertificateThumbprint '<THUMBPRINT>'
+```
+
+Setup checks the replacement certificate and its chain before it stops the WAC services. If validation fails, the current installation keeps running.
+
+**Verify the gateway.** On the gateway PC, read the configured port from the protected marker (default port `6600`). The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
+
+```powershell
+$markerPath = Join-Path $env:ProgramFiles 'WacClientCertificateMaintenance\wac-setup.json'
+$gatewayPort = (Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json).port
+curl.exe --head "https://localhost:$gatewayPort/"
+```
+
+To check TCP reachability alone, run `Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet`. A `True` result confirms that a listener accepted the connection. Use the HTTPS check above to authenticate the gateway and validate its certificate.
+
+For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If the certificate is still valid and Schannel reports `0x8009030D`, check private key access for `NETWORK SERVICE`.
