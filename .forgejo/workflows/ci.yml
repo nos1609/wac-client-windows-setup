@@ -20,27 +20,36 @@ jobs:
     if: ${{ github.event.repository.private && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature/')) }}
     runs-on: self-hosted
     outputs:
-      base: ${{ steps.range.outputs.base }}
+      base: ${{ steps.range.outputs.base_commit }}
     steps:
       - uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - id: range
+      - name: Check out the shared range action
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: nos1609/fj-actions-common
+          ref: 2896a7a7ef3a375220296510f2643ccef4476243
+          path: .ci-common
+          persist-credentials: false
+      - name: Validate the manual check base
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: bash
         env:
-          BASE: ${{ inputs.base_commit || github.event.before }}
+          BASE: ${{ inputs.base_commit }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
-          set -euo pipefail
-          if [[ -z "$BASE" || "$BASE" == 0000000000000000000000000000000000000000 ]]; then
-            BASE=$(git merge-base HEAD origin/main)
-          fi
-          [[ "$BASE" =~ ^[0-9a-f]{40}$ ]]
-          git merge-base --is-ancestor "$BASE" HEAD
-          printf 'base=%s\n' "$BASE" >> "$GITHUB_OUTPUT"
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$BASE" != 0000000000000000000000000000000000000000 && "$BASE" != "$HEAD_SHA" ]]
+      - id: range
+        uses: ./.ci-common/actions/candidate-range
+        with:
+          head_commit: ${{ github.sha }}
+          payload_before: ${{ inputs.base_commit || github.event.before || '0000000000000000000000000000000000000000' }}
+          first_push_base_ref: refs/remotes/origin/main
   portable:
     needs: prepare
-    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@6e799b414b34b6a56fd059a767220ab3c538223e
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@2e2efbb3ba05593e5bf6ed644537b4e87fb9e924
     with:
       base_commit: ${{ needs.prepare.outputs.base }}
       head_commit: ${{ github.sha }}
