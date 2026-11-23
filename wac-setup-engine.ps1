@@ -675,10 +675,14 @@ function Resolve-WacAdministrationTemplate {
   # In the combined installer, two conditional entries target the same path.
   $scratch = Join-Path $ExtractOut ('config-' + [guid]::NewGuid().ToString('N'))
   $result = Invoke-LoggedProcess -FilePath $InnoExtractPath -ArgumentList @(
-    '--silent','--collisions','rename','--include','app/Service/appsettings.json','--output-dir',$scratch,$InstallerPath
+    '--silent','--collisions','rename','--include','app\Service\appsettings.json','--output-dir',$scratch,$InstallerPath
   )
   if ($result.ExitCode -ne 0) { throw 'Could not extract the Administration Mode configuration variants.' }
-  $matchesAdmin = @(Get-ChildItem -LiteralPath (Join-Path $scratch 'app\Service') -File -Filter 'appsettings.json*' |
+  $variants = Join-Path $scratch 'app\Service'
+  if (-not (Test-Path -LiteralPath $variants -PathType Container)) {
+    throw 'No Administration Mode configuration variants were extracted. Check the Windows innoextract include filter.'
+  }
+  $matchesAdmin = @(Get-ChildItem -LiteralPath $variants -File -Filter 'appsettings.json*' |
     Where-Object { Test-WacAdministrationTemplate (Read-WacAppSettingsJson $_.FullName) })
   if ($matchesAdmin.Count -ne 1) { throw 'Cannot identify a unique Administration Mode configuration.' }
   return $matchesAdmin[0].FullName
@@ -753,21 +757,105 @@ function Remove-HttpSysBinding {
   [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "delete", "urlacl", "url=https://+:$BindingPort/") -LogOutputOnSuccess:$false)
 }
 
-function Grant-DirectoryAcl {
-  param([Parameter(Mandatory = $true)][string]$Path)
+function Assert-WacCodeAccess {
+  param([string]$Path, [switch]$Ancestor)
+  $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+  $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+  if ($null -eq $descriptor.DiscretionaryAcl) { throw "Missing discretionary ACL on $Path" }
+  $sidType = [Security.Principal.SecurityIdentifier]
+  $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+  # On ancestors, block replacement of a child or of the ancestor itself.
+  # In the executable tree, also block creating or writing files and attributes.
+  $unsafeRights = if ($Ancestor) { 0xD0040 } else { 0xD0156 }
+  $ownerRestricted = $false
+  foreach ($rule in $acl.GetAccessRules($true,$true,$sidType)) {
+    if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+    $sid = $rule.IdentityReference.Value
+    if ($sid -eq 'S-1-3-4') { $ownerRestricted = $true }
+    if ($rule.AccessControlType -eq 'Allow' -and $sid -notin $trusted -and ([int]$rule.FileSystemRights -band $unsafeRights)) {
+      throw "Unsafe access to a privileged WAC path: $Path (SID $sid)"
+    }
+  }
+  if (-not $ownerRestricted -and $acl.GetOwner($sidType).Value -notin $trusted) {
+    throw "Unrestricted owner of a privileged WAC path: $Path"
+  }
+}
 
-  Write-Log "Granting ACLs on $Path"
-  $args = @(
-    $Path,
-    "/grant",
-    "*S-1-5-18:(OI)(CI)F",
-    "*S-1-5-32-544:(OI)(CI)F",
-    "*S-1-5-20:(OI)(CI)M",
-    "*S-1-5-11:(OI)(CI)RX",
-    "/T",
-    "/C"
-  )
-  [void](Invoke-LoggedProcess -FilePath "icacls.exe" -ArgumentList $args -LogOutputOnSuccess:$false)
+function Assert-WacInstallLayout {
+  $roots = foreach ($target in @($InstallDir,$DataDir)) {
+    if ($target -notmatch '^[a-zA-Z]:\\' -or $target.Substring(2).Contains(':')) { throw "Expected a local drive path: $target" }
+    $path = [IO.Path]::GetFullPath($target).TrimEnd('\')
+    if ($path.Length -le 2) { throw 'A drive root cannot be a WAC installation directory.' }
+    if (Test-Path -LiteralPath $path) { Assert-WacLocalPath $path }
+    $parent = [IO.Directory]::GetParent($path)
+    while ($null -ne $parent) {
+      if ($parent.Exists) {
+        if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Unexpected reparse point: $parent" }
+        Assert-WacCodeAccess -Path $parent.FullName -Ancestor
+      }
+      $parent = $parent.Parent
+    }
+    $path + '\'
+  }
+  if ($roots[0].StartsWith($roots[1], [StringComparison]::OrdinalIgnoreCase) -or
+      $roots[1].StartsWith($roots[0], [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'The WAC installation and data directories must be separate.'
+  }
+}
+
+function Set-WacDirectorySecurity {
+  param([string]$Path, [switch]$Data)
+  # Protected code inherits read/execute for the gateway. OWNER RIGHTS prevents
+  # an individual file owner from changing the DACL through implicit WRITE_DAC.
+  $sddl = 'O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;AU)(A;OICI;FRFX;;;NS)(A;OICI;RC;;;OW)'
+  if ($Data) {
+    # Create files/directories at the data root; Modify only on ordinary children.
+    # The protected Updater directory never inherits these rights.
+    $sddl += '(A;;0x6;;;NS)(A;OICIIO;0x1301bf;;;NS)'
+  }
+  $acl = [Security.AccessControl.DirectorySecurity]::new()
+  $acl.SetSecurityDescriptorSddlForm($sddl)
+  Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+}
+
+function Initialize-WacInstallationDirectories {
+  $updater = Join-Path $DataDir 'Updater'
+  if (-not $KeepExistingData -and [IO.Directory]::Exists($DataDir)) { [IO.Directory]::Delete($DataDir, $true) }
+  if (-not [IO.Directory]::Exists($DataDir)) { New-Item -ItemType Directory -Path $DataDir -ErrorAction Stop | Out-Null }
+  Assert-WacLocalPath $DataDir
+  Set-WacDirectorySecurity -Path $DataDir
+  Assert-WacCodeAccess -Path $DataDir
+
+  # Rebuild both executable trees. Legacy installations granted explicit Modify
+  # on individual files, and merging into them would also retain stale DLLs.
+  foreach ($path in @($updater,$InstallDir)) {
+    if ([IO.Directory]::Exists($path)) {
+      Assert-WacLocalPath $path
+      [IO.Directory]::Delete($path, $true)
+    }
+    New-Item -ItemType Directory -Path $path -ErrorAction Stop | Out-Null
+    Assert-WacLocalPath $path
+    Set-WacDirectorySecurity -Path $path
+    Assert-WacCodeAccess -Path $path
+  }
+  Set-WacDirectorySecurity -Path $DataDir -Data
+  Assert-WacCodeAccess -Path $DataDir -Ancestor
+  Assert-WacCodeAccess -Path $updater
+}
+
+function Assert-WacExecutableTree {
+  param([string]$Path)
+  Assert-WacLocalPath $Path
+  Assert-WacCodeAccess -Path $Path
+  $pending = [Collections.Generic.Stack[string]]::new()
+  $pending.Push($Path)
+  while ($pending.Count) {
+    foreach ($child in [IO.DirectoryInfo]::new($pending.Pop()).EnumerateFileSystemInfos()) {
+      if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse point in the executable tree: $($child.FullName)" }
+      Assert-WacCodeAccess -Path $child.FullName
+      if ($child -is [IO.DirectoryInfo]) { $pending.Push($child.FullName) }
+    }
+  }
 }
 
 function Get-EffectiveCertificateSubject {
@@ -1526,6 +1614,16 @@ try {
     return
   }
   if ($setupMarker) {
+    if ([IO.Path]::GetFullPath($setupMarker.dataDir).TrimEnd('\') -ne [IO.Path]::GetFullPath($DataDir).TrimEnd('\')) {
+      throw 'The WAC marker points outside the selected data directory.'
+    }
+    if ($RefreshInstaller) {
+      $installed = Get-CimInstance -ClassName Win32_Service -Filter "Name='WindowsAdminCenter'" -ErrorAction Stop
+      $selectedDir = if ($script:OriginalBoundParameters.ContainsKey('InstallDir')) { $InstallDir } else { $setupMarker.installDir }
+      if ($installed -and $installed.PathName.Trim('"') -ne (Join-Path $selectedDir 'Service\WindowsAdminCenter.exe')) {
+        throw 'The selected installation directory does not match the installed gateway.'
+      }
+    }
     Apply-WacSetupMarkerDefaults -Marker $setupMarker
     $existingPreviousTrustedHosts = Get-WacMarkerValue -Marker $setupMarker -Name "previousTrustedHosts"
     if ($null -ne $existingPreviousTrustedHosts) { $script:PreviousTrustedHosts = [string]$existingPreviousTrustedHosts }
@@ -1618,6 +1716,7 @@ try {
   }
 
   if ($PSCmdlet.ShouldProcess($InstallDir, "Install Windows Admin Center")) {
+    Assert-WacInstallLayout
     Write-Log "Stopping/removing previous WAC services and bindings" "STEP"
     Stop-And-DeleteService $script:ServiceName
     Stop-And-DeleteService $script:AccountServiceName
@@ -1625,25 +1724,19 @@ try {
     Remove-HttpSysBinding -BindingPort $Port
 
     Write-Log "Copying files" "STEP"
-    if (-not $KeepExistingData) {
-      Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-      Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue
-    } else {
-      Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    New-Item -ItemType Directory -Path $InstallDir, $DataDir -Force | Out-Null
+    Initialize-WacInstallationDirectories
     Copy-DirectoryContents -Source $payloadApp -Destination $InstallDir -Exclude 'Enterprise'
     Copy-Item -LiteralPath $adminTemplate -Destination (Join-Path $InstallDir 'Service\appsettings.json') -Force
     if ((-not $KeepExistingData) -and (Test-Path -LiteralPath $payloadData)) {
-      Copy-DirectoryContents -Source $payloadData -Destination $DataDir
+      Copy-DirectoryContents -Source $payloadData -Destination $DataDir -Exclude 'Updater'
     } elseif ($KeepExistingData -and (Test-Path -LiteralPath (Join-Path $payloadData 'UX'))) {
       Copy-DirectoryContents -Source (Join-Path $payloadData 'UX') -Destination (Join-Path $DataDir 'UX')
     }
-    New-Item -ItemType Directory -Path (Join-Path $DataDir "Logs"), (Join-Path $DataDir "Database"), (Join-Path $DataDir "Updater") -Force | Out-Null
-    New-Item -ItemType File -Path (Join-Path $DataDir "Logs\Configuration.log") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $DataDir "Logs"), (Join-Path $DataDir "Database") -Force | Out-Null
+    $configLog = Join-Path $DataDir 'Logs\Configuration.log'
+    if (-not (Test-Path -LiteralPath $configLog)) { New-Item -ItemType File -Path $configLog -ErrorAction Stop | Out-Null }
 
-    Grant-DirectoryAcl -Path $InstallDir
-    Grant-DirectoryAcl -Path $DataDir
+    Assert-WacExecutableTree -Path $InstallDir
 
     try { New-EventLog -LogName Application -Source "WAC-Configuration" -ErrorAction SilentlyContinue } catch {}
 
@@ -1675,6 +1768,7 @@ try {
 
     Initialize-Database
     if (Copy-UpdaterFiles) {
+      Assert-WacExecutableTree -Path (Join-Path $DataDir 'Updater')
       Register-UpdaterScheduledTask
     }
     Register-Services

@@ -96,6 +96,8 @@ If WAC was already installed by this package, the wizard detects `C:\ProgramData
 
 To upgrade an existing installation to the current Administration Mode, run `.\wac-setup-engine.ps1 -RefreshInstaller` in elevated PowerShell. This downloads a fresh Microsoft-signed EXE to a separate directory, extracts it there, and preserves data for an installation with a marker. The default path still supports offline setup from a local EXE or cache. The WAC 2611 installer (WinGet package 3.0.0.6) combines Administration Mode and Virtualization Mode. The wrapper configures the Administration Mode services.
 
+During an upgrade, setup rebuilds the program directory and the `Updater` data subdirectory from the verified package. Administrators and SYSTEM can write to executable files. The WAC service retains write access to the database and logs. For custom paths, select separate local directories with protected parent directories.
+
 The canonical Microsoft installer URL is `https://aka.ms/WACDownload`. Microsoft Learn uses this URL for the PowerShell installation path for Windows Admin Center.
 
 The official WAC installer is not bundled as a binary in the publish package. `wac-setup-engine.ps1` first uses Windows Package Manager only to download the installer:
@@ -354,7 +356,7 @@ If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate th
 
 Add `-DataDir` for a custom data directory. Recovery checks the thumbprints in the marker, both WAC settings, the HTTP.SYS binding, and the WinRM HTTPS listener if the wrapper configured it. With seven days or less left, it rotates the certificate, restarts the gateway, and verifies the new thumbprint over TLS for the gateway names, including `localhost`. A failed probe restores the previous bindings. The previous certificate stays in the store.
 
-Installation or recovery of a wrapper-managed certificate registers the daily `WacClientCertificateRenewal` task. A missed run starts when possible. To trust the new certificate on the gateway PC, add `-TrustSelfSignedCertificate` to the recovery command. Remote clients that trust the individual self-signed certificate must trust the new thumbprint after rotation. Check the task and TLS with:
+Installation or recovery of a wrapper-managed certificate registers the daily `WacClientCertificateRenewal` task. The task can start and finish on battery power. A missed run starts when possible. To trust the new certificate on the gateway PC, add `-TrustSelfSignedCertificate` to the recovery command. Remote clients that trust the individual self-signed certificate must trust the new thumbprint after rotation. Check the task and TLS with:
 
 ```powershell
 Get-ScheduledTaskInfo -TaskName WacClientCertificateRenewal

@@ -146,7 +146,7 @@ function Register-WacRenewalTask {
   $exe = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
   $argsText = '-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "{0}" -ScheduledRenewal -LogPath "{1}"' -f $installedEngine,(Join-Path $dir 'renewal.log')
   $action = New-ScheduledTaskAction -Execute $exe -Argument $argsText -WorkingDirectory $dir
-  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew
+  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
   $trigger = New-ScheduledTaskTrigger -Daily -At '03:00'
   Register-ScheduledTask -TaskName 'WacClientCertificateRenewal' -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
 }
