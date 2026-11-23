@@ -386,17 +386,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -
 
 If the setup log in `C:\WAC-Diag` reports `No certificate private key ACL was changed`, check the key permissions with the certificate provider. Verify HTTPS after the repair.
 
-**Verify the gateway.** Run both checks on the gateway PC. The commands use the port from the protected marker and fall back to the default port `6600` if the file is absent. If a legacy installation uses a custom port, replace `6600` with that port. The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
+**Verify the gateway.** Run both checks on the gateway PC. The commands read the port from the protected marker. If the file is missing or the port is unspecified, they use the default port `6600`. If a legacy installation uses a custom port, replace `6600` with that port. The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
 
 ```powershell
 $markerPath = Join-Path $env:ProgramFiles 'WacClientCertificateMaintenance\wac-setup.json'
-$gatewayPort = if (Test-Path -LiteralPath $markerPath -ErrorAction Stop) {
-  (Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).port
-} else { 6600 }
+$gatewayPort = 6600
+if (Test-Path -LiteralPath $markerPath -ErrorAction Stop) {
+  $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+  $port = $marker.PSObject.Properties['port']
+  if ($port -and -not [string]::IsNullOrWhiteSpace($port.Value)) {
+    $gatewayPort = [int]$port.Value
+  }
+}
 Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet
 curl.exe --head "https://localhost:$gatewayPort/"
 ```
 
 A `True` result from `Test-NetConnection` confirms that a TCP listener accepted the connection. The HTTPS check verifies the gateway certificate and returns the HTTP response headers.
 
-For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned.
+For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If setup cannot read the marker or its `installedBy` field identifies another package, setup exits before stopping WAC services or removing installation directories. Check the data directory path and confirm which package owns the installation.

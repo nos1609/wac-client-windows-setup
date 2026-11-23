@@ -64,6 +64,21 @@ Describe 'WAC certificate maintenance' {
       (Get-Content -LiteralPath $selected -Raw | ConvertFrom-Json).port | Should -Be 7443
     }
 
+    It 'distinguishes an absent legacy marker from foreign or unreadable installation state' {
+      $DataDir = Join-Path $TestDrive 'legacy-marker'
+      $null = New-Item -ItemType Directory -Path $DataDir
+      Mock Get-WacProtectedMarkerPath { Join-Path $TestDrive 'no-protected-marker.json' }
+      Mock Assert-WacLocalPath {}
+      $path = Get-WacSetupMarkerPath $DataDir
+      Read-WacSetupMarker | Should -BeNullOrEmpty
+      [IO.File]::WriteAllText($path, '{"installedBy":"another-package"}')
+      Assert-FailsWith { Read-WacSetupMarker } 'Unexpected setup marker identity'
+      [IO.File]::WriteAllText($path, '{')
+      Assert-FailsWith { Read-WacSetupMarker } 'Could not read setup marker'
+      [IO.File]::WriteAllText($path, '{"installedBy":"wac-client-windows-setup","port":7443}')
+      (Read-WacSetupMarker).port | Should -Be 7443
+    }
+
     It 'uses a custom data directory from a protected marker when no directory was specified' {
       if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
         function Get-CimInstance { param($ClassName,$Filter) }

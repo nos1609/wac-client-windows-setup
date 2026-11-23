@@ -385,17 +385,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -
 
 Если журнал установки в `C:\WAC-Diag` содержит `No certificate private key ACL was changed`, проверьте права на ключ средствами его поставщика. После восстановления проверьте HTTPS.
 
-**Проверка шлюза.** Выполните обе проверки на ПК со шлюзом. Команды читают порт из защищённого маркера. Если файла нет, они используют порт по умолчанию `6600`. Для старой установки с другим портом подставьте его вместо `6600`. Для проверки HTTPS клиент должен доверять цепочке сертификата, а сертификат должен содержать запрошенное имя. Если в сертификате указано другое имя шлюза, подставьте его в URL.
+**Проверка шлюза.** Выполните обе проверки на ПК со шлюзом. Команды читают порт из защищённого маркера. Если файл отсутствует или в нём не указан порт, команды используют порт по умолчанию `6600`. Для старой установки с другим портом подставьте его вместо `6600`. Для проверки HTTPS клиент должен доверять цепочке сертификата, а сертификат должен содержать запрошенное имя. Если в сертификате указано другое имя шлюза, подставьте его в URL.
 
 ```powershell
 $markerPath = Join-Path $env:ProgramFiles 'WacClientCertificateMaintenance\wac-setup.json'
-$gatewayPort = if (Test-Path -LiteralPath $markerPath -ErrorAction Stop) {
-  (Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).port
-} else { 6600 }
+$gatewayPort = 6600
+if (Test-Path -LiteralPath $markerPath -ErrorAction Stop) {
+  $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+  $port = $marker.PSObject.Properties['port']
+  if ($port -and -not [string]::IsNullOrWhiteSpace($port.Value)) {
+    $gatewayPort = [int]$port.Value
+  }
+}
 Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet
 curl.exe --head "https://localhost:$gatewayPort/"
 ```
 
 Значение `True` от `Test-NetConnection` означает, что TCP-слушатель принял соединение. Команда `curl.exe` проверяет сертификат шлюза и возвращает заголовки HTTP-ответа.
 
-Старый маркер без признака источника распознаётся по отпечатку и признакам сертификата обёртки в `LocalMachine\My`. При неизвестном источнике отпечаток остаётся закреплённым.
+Старый маркер без признака источника распознаётся по отпечатку и признакам сертификата обёртки в `LocalMachine\My`. При неизвестном источнике отпечаток остаётся закреплённым. Если установщик не может прочитать маркер или поле `installedBy` указывает на другой пакет, установщик завершает работу до остановки служб WAC и удаления каталогов установки. Проверьте путь к каталогу данных и владельца установки.
