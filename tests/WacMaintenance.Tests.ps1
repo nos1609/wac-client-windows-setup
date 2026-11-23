@@ -192,8 +192,10 @@ Describe 'WAC certificate maintenance' {
   }
 
   It 'verifies the served leaf, TLS name and trust policy on loopback' {
-    $rsa = [Security.Cryptography.RSA]::Create()
-    $rsa.KeySize = 2048
+    # Desktop .NET's default RSA provider cannot resize an existing key.
+    $rsa = if ($env:OS -eq 'Windows_NT') {
+      [Security.Cryptography.RSACng]::new(2048)
+    } else { [Security.Cryptography.RSA]::Create(2048) }
     $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
       'CN=localhost', $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
     $san = [Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()
