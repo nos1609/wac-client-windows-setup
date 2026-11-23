@@ -10,10 +10,9 @@ on:
         required: true
         type: string
 
-# A new push checks the newest commit on that branch. Manual runs have their own queue.
 concurrency:
-  group: wac-portable-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: ${{ github.event_name == 'push' && 'wac-review' || 'wac-portable' }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   prepare:
@@ -55,3 +54,44 @@ jobs:
       head_commit: ${{ github.sha }}
       script_path: scripts/test-portable.ps1
       runs_on: self-hosted
+
+  # Keep event selection on a regular job so the reusable workflow receives an exact range.
+  review_range:
+    needs: prepare
+    if: ${{ github.event_name == 'push' && github.event.repository.private }}
+    runs-on: self-hosted
+    outputs:
+      base: ${{ steps.target.outputs.base }}
+    steps:
+      - name: Check out the feature history
+        if: ${{ startsWith(github.ref, 'refs/heads/feature/') }}
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: target
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          PUSH_BASE: ${{ needs.prepare.outputs.base }}
+        run: |
+          set -euo pipefail
+          case "$REF" in
+            refs/heads/feature/*) base=$(git merge-base "$HEAD_SHA" refs/remotes/origin/main) ;;
+            refs/heads/main) base=$PUSH_BASE ;;
+            *) exit 1 ;;
+          esac
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$base" != "$HEAD_SHA" ]]
+          printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: [portable, review_range]
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@2e2efbb3ba05593e5bf6ed644537b4e87fb9e924
+    with:
+      base_commit: ${{ needs.review_range.outputs.base }}
+      expected_head_sha: ${{ github.sha }}
+      workflow_id: ci.yml
+      continue_on_error: false
+      upload_prompts: false
