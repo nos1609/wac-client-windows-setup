@@ -129,6 +129,16 @@ Describe 'WAC certificate maintenance' {
     $switches | Should -Contain 'DontStopIfGoingOnBatteries'
   }
 
+  It 'ignores DELETE only on the volume root and keeps child replacement rights blocked' {
+    $rootPath = [IO.Path]::GetPathRoot($TestDrive)
+    $rootMask = Get-WacUnsafeAccessMask $rootPath -Ancestor
+    $parentMask = Get-WacUnsafeAccessMask $TestDrive -Ancestor
+    ($rootMask -band 0x1301bf) | Should -Be 0
+    ($rootMask -band 0xC0040) | Should -Be 0xC0040
+    ($parentMask -band 0x1301bf) | Should -Be 0x10000
+    ((Get-WacUnsafeAccessMask $TestDrive) -band 0x156) | Should -Be 0x156
+  }
+
   It 'rebuilds legacy code trees while preserving the database on upgrade' {
     $InstallDir = Join-Path $TestDrive 'program'
     $DataDir = Join-Path $TestDrive 'data'

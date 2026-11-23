@@ -757,6 +757,15 @@ function Remove-HttpSysBinding {
   [void](Invoke-LoggedProcess -FilePath "netsh.exe" -ArgumentList @("http", "delete", "urlacl", "url=https://+:$BindingPort/") -LogOutputOnSuccess:$false)
 }
 
+function Get-WacUnsafeAccessMask {
+  param([string]$Path, [switch]$Ancestor)
+  if (-not $Ancestor) { return 0xD0156 }
+  # DELETE on the volume root cannot remove the volume. DELETE_CHILD, WRITE_DAC
+  # and WRITE_OWNER can still compromise its children and must be checked.
+  if ($null -eq [IO.Directory]::GetParent([IO.Path]::GetFullPath($Path))) { return 0xC0040 }
+  return 0xD0040
+}
+
 function Assert-WacCodeAccess {
   param([string]$Path, [switch]$Ancestor)
   $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
@@ -766,7 +775,7 @@ function Assert-WacCodeAccess {
   $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
   # On ancestors, block replacement of a child or of the ancestor itself.
   # In the executable tree, also block creating or writing files and attributes.
-  $unsafeRights = if ($Ancestor) { 0xD0040 } else { 0xD0156 }
+  $unsafeRights = Get-WacUnsafeAccessMask -Path $Path -Ancestor:$Ancestor
   $ownerRestricted = $false
   foreach ($rule in $acl.GetAccessRules($true,$true,$sidType)) {
     if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
