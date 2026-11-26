@@ -17,13 +17,15 @@ concurrency:
 jobs:
   prepare:
     if: ${{ github.event.repository.private && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature/')) }}
-    runs-on: self-hosted
+    runs-on: ${{ vars.COMMON_LIGHT_RUNNER || 'self-hosted' }}
     outputs:
       base: ${{ steps.range.outputs.base_commit }}
       head: ${{ steps.candidate.outputs.head }}
+      review_base: ${{ steps.target.outputs.base }}
     steps:
       - uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Bind the checked-out commit to the event
@@ -57,36 +59,14 @@ jobs:
           head_commit: ${{ github.sha }}
           payload_before: ${{ inputs.base_commit || github.event.before || '0000000000000000000000000000000000000000' }}
           first_push_base_ref: refs/remotes/origin/main
-  portable:
-    needs: prepare
-    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@51eeddc3382f952caa6c4758f52f8cef6498fd9d
-    with:
-      base_commit: ${{ needs.prepare.outputs.base }}
-      head_commit: ${{ needs.prepare.outputs.head }}
-      script_path: scripts/test-portable.ps1
-      runs_on: self-hosted
-
-  # Keep event selection on a regular job so the reusable workflow receives an exact range.
-  review_range:
-    needs: prepare
-    if: ${{ github.event_name == 'push' && github.event.repository.private }}
-    runs-on: self-hosted
-    outputs:
-      base: ${{ steps.target.outputs.base }}
-    steps:
-      - name: Check out the feature history
-        if: ${{ startsWith(github.ref, 'refs/heads/feature/') }}
-        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - id: target
+      - name: Select the full review range
+        id: target
+        if: ${{ github.event_name == 'push' }}
         shell: bash
         env:
           REF: ${{ github.ref }}
           HEAD_SHA: ${{ github.sha }}
-          PUSH_BASE: ${{ needs.prepare.outputs.base }}
+          PUSH_BASE: ${{ steps.range.outputs.base_commit }}
         run: |
           set -euo pipefail
           case "$REF" in
@@ -97,11 +77,21 @@ jobs:
           [[ "$base" =~ ^[0-9a-f]{40}$ && "$base" != "$HEAD_SHA" ]]
           printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
 
-  review:
-    needs: [prepare, portable, review_range]
-    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@51eeddc3382f952caa6c4758f52f8cef6498fd9d
+  portable:
+    needs: prepare
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@d96ce5c17d93fda23e3c9e4962b37d352bcb4028
     with:
-      base_commit: ${{ needs.review_range.outputs.base }}
+      base_commit: ${{ needs.prepare.outputs.base }}
+      head_commit: ${{ needs.prepare.outputs.head }}
+      script_path: scripts/test-portable.ps1
+      runs_on: self-hosted
+
+  review:
+    if: ${{ github.event_name == 'push' && github.event.repository.private }}
+    needs: [prepare, portable]
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@d96ce5c17d93fda23e3c9e4962b37d352bcb4028
+    with:
+      base_commit: ${{ needs.prepare.outputs.review_base }}
       expected_head_sha: ${{ needs.prepare.outputs.head }}
       workflow_id: ci.yml
       continue_on_error: false

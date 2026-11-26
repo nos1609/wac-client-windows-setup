@@ -30,9 +30,7 @@ try {
   if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $expected) {
     throw 'Release archive SHA256 mismatch.'
   }
-  $expectedFiles = @('install-wac.cmd','interactive-installer.ps1','wac-setup-engine.ps1','wac-certificate.ps1',
-    'LICENSE','VERSION','README.md','README.en.md','NOTICE.md','NOTICE.en.md','SECURITY.md','SECURITY.en.md',
-    'tui/WacTui.Locale.ps1','tui/WacTui.Model.ps1','tui/WacTui.Progress.ps1','tui/WacTui.Render.ps1','tui/WacTui.Validation.ps1')
+  $expectedFiles = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'package-files.txt')
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   $archive = [IO.Compression.ZipFile]::OpenRead($zip)
   try {

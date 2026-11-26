@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: self-hosted
+    runs-on: ${{ vars.COMMON_LIGHT_RUNNER || 'self-hosted' }}
     steps:
       - name: Verify the private review target
         shell: bash
@@ -37,7 +37,7 @@ jobs:
 
   portable:
     needs: prepare
-    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@51eeddc3382f952caa6c4758f52f8cef6498fd9d
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@d96ce5c17d93fda23e3c9e4962b37d352bcb4028
     with:
       base_commit: ${{ inputs.base_commit }}
       head_commit: ${{ inputs.expected_head_sha }}
@@ -45,7 +45,7 @@ jobs:
 
   review:
     needs: portable
-    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@51eeddc3382f952caa6c4758f52f8cef6498fd9d
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@d96ce5c17d93fda23e3c9e4962b37d352bcb4028
     with:
       base_commit: ${{ inputs.base_commit }}
       expected_head_sha: ${{ inputs.expected_head_sha }}

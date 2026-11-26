@@ -573,6 +573,45 @@ Describe 'WAC certificate maintenance' {
       $boundHash | Should -Be $newHash
       $restarts | Should -Be 1
     }
+    Context 'Managed WinRM listener' {
+      BeforeEach {
+        $state.winRmHttpsMode = 'Enable'
+        $script:listenerPath = Join-Path $fixture 'CertificateThumbprint'
+        $script:listenerHash = $oldHash
+        $script:listenerWrites = @()
+        Mock Get-ChildItem {
+          [pscustomobject]@{Keys=@('Transport=HTTPS','Address=*'); PSPath=$fixture}
+        } -ParameterFilter { $Path -like 'WSMan:*' }
+        Mock Get-Item { [pscustomobject]@{Value=$script:listenerHash} } -ParameterFilter { $LiteralPath -eq $script:listenerPath }
+        Mock Set-Item {
+          $script:listenerWrites += $Value
+          $script:listenerHash = $Value
+        } -ParameterFilter { $LiteralPath -eq $script:listenerPath }
+      }
+      It 'preserves a listener changed after the initial binding check' {
+        Mock Grant-CertificatePrivateKeyAcl { $script:listenerHash = 'C' * 40 }
+        Assert-FailsWith { Invoke-WacCertificateRotation $state } 'WinRM'
+        $listenerWrites.Count | Should -Be 0
+        $listenerHash | Should -Be ('C' * 40)
+        $boundHash | Should -Be $oldHash
+        (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $true
+      }
+      It 'preserves an external listener change during rollback' {
+        Mock Assert-WacServedCertificate { $script:listenerHash = 'C' * 40; throw 'TLS probe failed' }
+        Assert-FailsWith { Invoke-WacCertificateRotation $state } 'TLS probe failed'
+        $listenerWrites.Count | Should -Be 1
+        $listenerHash | Should -Be ('C' * 40)
+        $boundHash | Should -Be $oldHash
+        (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $true
+      }
+      It 'restores the listener changed by this rotation on a TLS failure' {
+        Mock Assert-WacServedCertificate { throw 'TLS probe failed' }
+        Assert-FailsWith { Invoke-WacCertificateRotation $state } 'TLS probe failed'
+        ($listenerWrites -join ',') | Should -Be "$newHash,$oldHash"
+        $listenerHash | Should -Be $oldHash
+        (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $false
+      }
+    }
     It 'restores the previous bindings when TLS verification fails' {
       $PSDefaultParameterValues = @{'Get-Content:Encoding' = 'ASCII'}
       Mock Assert-WacServedCertificate { throw 'TLS probe failed' }

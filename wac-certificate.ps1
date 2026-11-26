@@ -372,7 +372,7 @@ function Invoke-WacCertificateRotation {
     })
     if ($listener.Count -ne 1) { throw 'Cannot identify the existing WinRM HTTPS listener.' }
     $wsPath = Join-Path $listener[0].PSPath 'CertificateThumbprint'
-    $previousWinRm = (Get-Item -LiteralPath $wsPath).Value
+    $previousWinRm = (Get-Item -LiteralPath $wsPath -ErrorAction Stop).Value
     if ($previousWinRm -notin $allowed) { throw 'WinRM uses a different certificate.' }
     $previousBindings += $previousWinRm
   }
@@ -419,17 +419,28 @@ function Invoke-WacCertificateRotation {
       $httpChanged = $true
       Set-WacHttpBindingHash $port $next.Thumbprint
     }
-    if ($wsPath -and $previousWinRm -ne $next.Thumbprint) {
-      $wsChanged = $true
-      Set-Item -LiteralPath $wsPath -Value $next.Thumbprint -Force
+    if ($wsPath) {
+      $liveWinRm = (Get-Item -LiteralPath $wsPath -ErrorAction Stop).Value
+      if ($liveWinRm -ne $previousWinRm) { throw 'WinRM listener changed during certificate rotation.' }
+      if ($liveWinRm -ne $next.Thumbprint) {
+        $wsChanged = $true
+        Set-Item -LiteralPath $wsPath -Value $next.Thumbprint -Force -ErrorAction Stop
+      }
     }
     Restart-Service -Name WindowsAdminCenter -ErrorAction Stop
     Assert-WacServedCertificate $next $names $port -AllowUntrustedRoot:(!$trust)
   } catch {
     $failure = $_
     $recoveryErrors = @()
-    if ($wsChanged) {
-      try { Set-Item -LiteralPath $wsPath -Value $previousWinRm -Force } catch { $recoveryErrors += $_.Exception.Message }
+    if ($wsPath) {
+      try {
+        $liveWinRm = (Get-Item -LiteralPath $wsPath -ErrorAction Stop).Value
+        if ($wsChanged -and $liveWinRm -eq $next.Thumbprint) {
+          Set-Item -LiteralPath $wsPath -Value $previousWinRm -Force -ErrorAction Stop
+        } elseif ($liveWinRm -ne $previousWinRm) {
+          throw 'WinRM listener changed outside the rotation. Review its certificate before retrying.'
+        }
+      } catch { $recoveryErrors += $_.Exception.Message }
     }
     if ($httpChanged) {
       try { Set-WacHttpBindingHash $port $httpHash } catch { $recoveryErrors += $_.Exception.Message }
