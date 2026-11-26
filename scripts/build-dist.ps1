@@ -63,6 +63,7 @@ foreach ($item in @(
   "install-wac.cmd",
   "interactive-installer.ps1",
   "wac-setup-engine.ps1",
+  "wac-certificate.ps1",
   "README.md",
   "README.en.md",
   "VERSION",

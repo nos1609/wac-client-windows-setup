@@ -1,3 +1,5 @@
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'wac-certificate.ps1')
+
 function New-WacTuiConfig {
   return [pscustomobject]@{
     InstallerPath = ""
@@ -11,6 +13,7 @@ function New-WacTuiConfig {
     EndpointFqdn = $env:COMPUTERNAME
     ServiceFqdn = "localhost"
     CertificateThumbprint = ""
+    OriginalCertificateSource = ""
     CertificateSubject = "WindowsAdminCenterSelfSigned"
     SoftwareUpdateMode = "Manual"
     TrustSelfSignedCertificate = $false
@@ -30,11 +33,6 @@ function New-WacTuiConfig {
   }
 }
 
-function Get-WacSetupMarkerPath {
-  param([string]$DataDir = "$env:ProgramData\WindowsAdminCenter")
-  return [System.IO.Path]::Combine($DataDir, "wac-setup.json")
-}
-
 function ConvertFrom-WacSetupMarker {
   param([Parameter(Mandatory = $true)]$Marker)
 
@@ -46,7 +44,11 @@ function ConvertFrom-WacSetupMarker {
   if ($Marker.servicePortEnd) { $config.ServicePortEnd = [int]$Marker.servicePortEnd }
   if ($Marker.endpointFqdn) { $config.EndpointFqdn = [string]$Marker.endpointFqdn }
   if ($Marker.serviceFqdn) { $config.ServiceFqdn = [string]$Marker.serviceFqdn }
-  if ($Marker.certificateThumbprint) { $config.CertificateThumbprint = [string]$Marker.certificateThumbprint }
+  $config.OriginalCertificateSource = Get-WacMarkerCertificateSource $Marker
+  if ($Marker.certificateThumbprint -and $config.OriginalCertificateSource -eq 'Explicit') {
+    $config.CertificateThumbprint = [string]$Marker.certificateThumbprint
+  }
+  if ($Marker.trustSelfSignedCertificate) { $config.TrustSelfSignedCertificate = $true }
   if ($Marker.certificateSubject) { $config.CertificateSubject = [string]$Marker.certificateSubject }
   if ($Marker.softwareUpdateMode) { $config.SoftwareUpdateMode = [string]$Marker.softwareUpdateMode }
   if ($Marker.diagnosticDataMode) { $config.DiagnosticDataMode = [string]$Marker.diagnosticDataMode }
@@ -63,25 +65,32 @@ function Get-WacTuiInstallState {
     [string]$InstallDir = "$env:ProgramFiles\WindowsAdminCenter"
   )
 
-  $markerPath = Get-WacSetupMarkerPath -DataDir $DataDir
+  $protectedPath = Get-WacProtectedMarkerPath
+  $markerPath = $protectedPath
   $config = New-WacTuiConfig
-  $isInstalledByThisSetup = $false
-  if (Test-Path -LiteralPath $markerPath) {
-    try {
-      $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
-      if ($marker.installedBy -eq "wac-client-windows-setup") {
+  $markerStatus = 'Absent'
+  try {
+    $markerPath = Get-WacReadableMarkerPath -DataDir $DataDir -ProtectedPath $protectedPath
+    $marker = Read-WacSetupMarker -Path $markerPath
+    if ($null -ne $marker) {
+      $useRecordedDir = $markerPath -eq $protectedPath -and -not $PSBoundParameters.ContainsKey('DataDir')
+      if ($useRecordedDir -or
+          [IO.Path]::GetFullPath($marker.dataDir).TrimEnd('\') -eq [IO.Path]::GetFullPath($DataDir).TrimEnd('\')) {
         $config = ConvertFrom-WacSetupMarker -Marker $marker
-        $isInstalledByThisSetup = $true
+        $markerStatus = 'Valid'
+      } else {
+        $markerStatus = 'Invalid'
       }
-    } catch {
-      $isInstalledByThisSetup = $false
     }
+  } catch {
+    $markerStatus = 'Invalid'
   }
 
   $service = Get-Service -Name WindowsAdminCenter -ErrorAction SilentlyContinue
   $exePath = Join-Path $InstallDir "Service\WindowsAdminCenter.exe"
   return [pscustomobject]@{
-    IsInstalledByThisSetup = $isInstalledByThisSetup
+    IsInstalledByThisSetup = $markerStatus -eq 'Valid'
+    MarkerStatus = $markerStatus
     IsWacPresent = [bool]($service -or (Test-Path -LiteralPath $exePath))
     MarkerPath = $markerPath
     Config = $config
@@ -178,6 +187,9 @@ function ConvertTo-WacSetupEngineArguments {
   Add-WacArgument $arguments "EndpointFqdn" $Config.EndpointFqdn
   Add-WacArgument $arguments "ServiceFqdn" $Config.ServiceFqdn
   Add-WacArgument $arguments "CertificateThumbprint" $Config.CertificateThumbprint
+  if ($Config.OriginalCertificateSource -eq 'Explicit' -and [string]::IsNullOrWhiteSpace($Config.CertificateThumbprint)) {
+    [void]$arguments.Add('-GenerateCertificate')
+  }
   if ([string]::IsNullOrWhiteSpace($Config.CertificateThumbprint) -and -not (Test-WacDefaultCertificateSubject -Subject $Config.CertificateSubject)) {
     Add-WacArgument $arguments "CertificateSubject" $Config.CertificateSubject
   }

@@ -28,17 +28,18 @@ function Get-PublicFiles {
     "VERSION",
     "SECURITY.md",
     "SECURITY.en.md",
-    "wac-setup-engine.ps1"
+    "wac-setup-engine.ps1",
+    "wac-certificate.ps1"
   )
 
   foreach ($relativePath in $publicRootFiles) {
     $path = Join-Path $repoRoot $relativePath
     if (Test-Path -LiteralPath $path) {
-      Get-Item -LiteralPath $path
+      Get-Item -LiteralPath $path -Force
     }
   }
 
-  foreach ($relativePath in @(".github", "scripts", "tests", "tui")) {
+  foreach ($relativePath in @(".github", ".forgejo", "scripts", "tests", "tui")) {
     $path = Join-Path $repoRoot $relativePath
     if (Test-Path -LiteralPath $path) {
       Get-ChildItem -LiteralPath $path -Recurse -Force -File
@@ -58,6 +59,7 @@ foreach ($relativePath in @(
   "AGENTS.md",
   "interactive-installer.ps1",
   "wac-setup-engine.ps1",
+  "wac-certificate.ps1",
   "tui\WacTui.Locale.ps1",
   "tui\WacTui.Model.ps1",
   "tui\WacTui.Progress.ps1",
@@ -120,21 +122,18 @@ if (-not $SkipScriptAnalyzer) {
 }
 
 if (-not $SkipPester) {
-  $pester = Get-Module -ListAvailable -Name Pester | Select-Object -First 1
-  if ($pester) {
-    Write-Check "Pester"
-    $pesterResult = Invoke-Pester -Path (Join-Path $repoRoot "tests") -EnableExit:$false -PassThru
-    $failedCount = 0
-    if ($null -ne $pesterResult.FailedCount) {
-      $failedCount = [int]$pesterResult.FailedCount
-    } elseif ($null -ne $pesterResult.TestResult) {
-      $failedCount = @($pesterResult.TestResult | Where-Object { $_.Result -eq "Failed" }).Count
-    }
-    if ($failedCount -gt 0) {
-      throw "Pester reported $failedCount failed test(s)."
-    }
+  Write-Check "Windows release tests (Pester 4.10.1)"
+  $pesterSpec = @{ ModuleName = 'Pester'; RequiredVersion = '4.10.1' }
+  # Windows PowerShell CI can preload the manifest from a PowerShell 7 module directory.
+  $loadedPester = Get-Module -FullyQualifiedName $pesterSpec | Select-Object -First 1
+  if ($loadedPester) {
+    Import-Module -ModuleInfo $loadedPester -Scope Local -ErrorAction Stop
   } else {
-    Write-Warning "Pester is not installed; skipping Pester tests."
+    Import-Module -FullyQualifiedName $pesterSpec -Scope Local -ErrorAction Stop
+  }
+  $pesterResult = Invoke-Pester -Path (Join-Path $repoRoot "tests") -EnableExit:$false -PassThru
+  if ($pesterResult.FailedCount -gt 0 -or $pesterResult.PassedCount -lt 1) {
+    throw "Pester reported $($pesterResult.PassedCount) passed and $($pesterResult.FailedCount) failed tests."
   }
 }
 

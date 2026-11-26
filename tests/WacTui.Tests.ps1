@@ -168,6 +168,7 @@ Describe "WacTui.Model" {
 
   It "loads installation parameters from the current setup marker" {
     $root = Join-Path ([System.IO.Path]::GetTempPath()) ("wac-marker-test-" + [guid]::NewGuid().ToString("N"))
+    Mock Get-WacProtectedMarkerPath { Join-Path $root 'absent.json' }
     $dataDir = Join-Path $root "Data"
     New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
     try {
@@ -207,6 +208,7 @@ Describe "WacTui.Model" {
 
   It "does not treat foreign setup markers as ours" {
     $root = Join-Path ([System.IO.Path]::GetTempPath()) ("wac-marker-test-" + [guid]::NewGuid().ToString("N"))
+    Mock Get-WacProtectedMarkerPath { Join-Path $root 'absent.json' }
     $dataDir = Join-Path $root "Data"
     New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
     try {

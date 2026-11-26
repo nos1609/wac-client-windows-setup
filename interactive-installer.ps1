@@ -1755,9 +1755,18 @@ function Test-WacTuiShouldRenderInstallStatus {
   return $false
 }
 
+function Assert-WacTuiMarkerState {
+  param($InstallState, [string]$Language)
+  if ($InstallState.MarkerStatus -eq 'Invalid') {
+    throw ((Get-WacTuiUiText -Key 'InvalidSetupMarker' -Language $Language) -f $InstallState.MarkerPath)
+  }
+}
+
 function Invoke-WacTuiApply {
   param([Parameter(Mandatory = $true)]$Config)
 
+  $state = Get-WacTuiInstallState -DataDir $Config.DataDir -InstallDir $Config.InstallDir
+  Assert-WacTuiMarkerState -InstallState $state -Language $Config.Language
   $setupEngine = Join-Path $script:ScriptRoot "wac-setup-engine.ps1"
   $powerShellPath = Get-WacTuiWindowsPowerShellPath
   $sudoPath = Get-WacTuiSudoPath
@@ -1829,6 +1838,7 @@ function Start-WacTuiWizard {
   $resolvedLanguage = Get-WacTuiLanguage -Language $Language
   $script:ResolvedLanguage = $resolvedLanguage
   $installState = Get-WacTuiInstallState
+  Assert-WacTuiMarkerState -InstallState $installState -Language $resolvedLanguage
   $config = $installState.Config
   $config.Language = $resolvedLanguage
   $platformRisk = Get-WacTuiCurrentPlatformRisk

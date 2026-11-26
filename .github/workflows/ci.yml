@@ -23,7 +23,17 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Pester 4
-        run: Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck
+        run: |
+          Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          $module = Import-Module Pester -RequiredVersion 4.10.1 -Force -PassThru
+          "WAC_PESTER4_MODULE=$(Join-Path $module.ModuleBase 'Pester.psd1')" >> $env:GITHUB_ENV
+
+      - name: Check production scripts under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Windows PowerShell 5.1 is required.' }
+          Import-Module $env:WAC_PESTER4_MODULE -Force
+          .\scripts\test-release.ps1 -SkipScriptAnalyzer
 
       - name: Run release checks
         run: |

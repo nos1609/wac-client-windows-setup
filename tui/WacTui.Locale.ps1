@@ -157,6 +157,10 @@ $script:WacTuiStrings = @{
     En = "Installation cancelled by user."
     Ru = "Установка отменена пользователем."
   }
+  InvalidSetupMarker = @{
+    En = "Cannot use the setup marker at '{0}'. Check read access and the installedBy and dataDir fields, then restart the wizard."
+    Ru = "Не удалось использовать маркер установки «{0}». Проверьте права на чтение и поля installedBy и dataDir, затем запустите мастер снова."
+  }
   ErrorPrefix = @{
     En = "ERROR"
     Ru = "ОШИБКА"
