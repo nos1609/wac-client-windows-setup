@@ -1,0 +1,110 @@
+name: WAC portable checks
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  workflow_dispatch:
+    inputs:
+      base_commit:
+        description: Full base commit SHA for the trusted candidate
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.event_name == 'push' && 'wac-review' || 'wac-portable' }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ github.event.repository.private && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature/')) }}
+    runs-on: self-hosted
+    outputs:
+      base: ${{ steps.range.outputs.base_commit }}
+      head: ${{ steps.candidate.outputs.head }}
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind the checked-out commit to the event
+        id: candidate
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse --verify HEAD)
+          [[ "$head" =~ ^[0-9a-f]{40}$ && "$head" == "$EVENT_SHA" ]]
+          printf 'head=%s\n' "$head" >> "$GITHUB_OUTPUT"
+      - name: Check out the shared range action
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: nos1609/fj-actions-common
+          ref: 2896a7a7ef3a375220296510f2643ccef4476243
+          path: .ci-common
+          persist-credentials: false
+      - name: Validate the manual check base
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          BASE: ${{ inputs.base_commit }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$BASE" != 0000000000000000000000000000000000000000 && "$BASE" != "$HEAD_SHA" ]]
+      - id: range
+        uses: ./.ci-common/actions/candidate-range
+        with:
+          head_commit: ${{ github.sha }}
+          payload_before: ${{ inputs.base_commit || github.event.before || '0000000000000000000000000000000000000000' }}
+          first_push_base_ref: refs/remotes/origin/main
+  portable:
+    needs: prepare
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@17bb802ee8b39caf95630459073ddcbb286d9d90
+    with:
+      base_commit: ${{ needs.prepare.outputs.base }}
+      head_commit: ${{ needs.prepare.outputs.head }}
+      script_path: scripts/test-portable.ps1
+      runs_on: self-hosted
+
+  # Keep event selection on a regular job so the reusable workflow receives an exact range.
+  review_range:
+    needs: prepare
+    if: ${{ github.event_name == 'push' && github.event.repository.private }}
+    runs-on: self-hosted
+    outputs:
+      base: ${{ steps.target.outputs.base }}
+    steps:
+      - name: Check out the feature history
+        if: ${{ startsWith(github.ref, 'refs/heads/feature/') }}
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: target
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          PUSH_BASE: ${{ needs.prepare.outputs.base }}
+        run: |
+          set -euo pipefail
+          case "$REF" in
+            refs/heads/feature/*) base=$(git merge-base "$HEAD_SHA" refs/remotes/origin/main) ;;
+            refs/heads/main) base=$PUSH_BASE ;;
+            *) exit 1 ;;
+          esac
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$base" != "$HEAD_SHA" ]]
+          printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: [prepare, portable, review_range]
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@17bb802ee8b39caf95630459073ddcbb286d9d90
+    with:
+      base_commit: ${{ needs.review_range.outputs.base }}
+      expected_head_sha: ${{ needs.prepare.outputs.head }}
+      workflow_id: ci.yml
+      continue_on_error: false
+      rate_limit_max_wait_seconds: "1980"
+      process_timeout_seconds: "2400"
+      upload_prompts: true

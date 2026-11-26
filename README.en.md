@@ -55,7 +55,7 @@ Before publishing, run from the repository root:
 .\scripts\build-dist.ps1
 ```
 
-`test-release.ps1` checks PowerShell syntax, Pester tests, PSScriptAnalyzer when the module is available, local-path leaks, and forbidden binaries. `build-dist.ps1` creates `dist\wac-client-windows-setup.zip` and a matching SHA256 file.
+`test-release.ps1` runs the full Windows test suite with Pester 4.10.1. It also checks PowerShell syntax, runs PSScriptAnalyzer when available, and checks for local paths and forbidden binaries. `build-dist.ps1` creates `dist\wac-client-windows-setup.zip` and a matching SHA256 file.
 
 ## Quick Start
 
@@ -92,7 +92,17 @@ Available fields: install directory, data directory, gateway HTTPS port, service
 
 When the wizard runs on ARM64, the first action screen shows a separate red warning. There is no ARM64 checkbox in custom setup: the interactive wizard adds `-SkipArchitectureCheck` automatically, while direct `wac-setup-engine.ps1` runs still require that switch explicitly.
 
-If WAC was already installed by this package, the wizard detects `C:\ProgramData\WindowsAdminCenter\wac-setup.json` and shows uninstall as the first action. Normal uninstall removes services, the scheduled task, HTTP.SYS binding, firewall rules, and program files, while keeping WAC data. Full uninstall also removes the WAC data directory and is highlighted as a risky action.
+If WAC was already installed by this package, the wizard reads the protected marker at `%ProgramFiles%\WacClientCertificateMaintenance\wac-setup.json` and shows uninstall as the first action. Normal uninstall removes services, the scheduled task, HTTP.SYS binding, firewall rules, and program files, while keeping WAC data. Full uninstall also removes the WAC data directory and is highlighted as a risky action. During upgrade or certificate recovery, setup checks the legacy installation path against the registered service and moves the marker out of the data directory.
+
+To upgrade an existing installation to Administration Mode, open PowerShell as administrator in the wrapper directory.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -RefreshInstaller
+```
+
+This downloads a fresh Microsoft-signed EXE to a separate directory, extracts it there, and preserves data for an installation with a marker. The default path still supports offline setup from a local EXE or cache. The WAC 2611 installer (WinGet package 3.0.0.6) combines Administration Mode and Virtualization Mode. The wrapper configures the Administration Mode services.
+
+During an upgrade, setup rebuilds the program directory and the `Updater` data subdirectory from the verified package. Administrators and SYSTEM can write to executable files. The WAC service retains write access to the database and logs. For custom paths, select separate local directories with protected parent directories.
 
 The canonical Microsoft installer URL is `https://aka.ms/WACDownload`. Microsoft Learn uses this URL for the PowerShell installation path for Windows Admin Center.
 
@@ -342,27 +352,59 @@ By default, existing WAC files and data are replaced. To preserve `C:\ProgramDat
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData
 ```
 
-If WAC services are running and port `6600` is listening, but the browser or `curl -k -I https://localhost:6600` fails during TLS handshake, check Schannel in the System Event Log. Error `0x8009030D` usually means the HTTPS layer cannot read the WAC certificate private key as `NETWORK SERVICE`.
+### Recover and renew the gateway certificate
 
-In that case, the clean repair path is to rotate WAC to a new certificate instead of reusing the old key binding:
+If Schannel reports `SEC_E_CERT_EXPIRED`, check the expiry of the certificate that the gateway serves. Open PowerShell as administrator in the wrapper directory. Use the recovery command for the certificate source. The protected marker records the data directory. For an older installation with its marker in a custom data directory, specify that directory with `-DataDir`.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData -TrustSelfSignedCertificate
-```
-
-On ARM64:
+**Wrapper-managed certificate.** Run the renewal command.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -SkipArchitectureCheck -KeepExistingData -TrustSelfSignedCertificate
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -RenewCertificate
 ```
 
-These commands preserve `C:\ProgramData\WindowsAdminCenter` and create or reuse a certificate for the current `Endpoint FQDN`. If WAC must open through an external CNAME, pass it explicitly with `-EndpointFqdn`; with WinRM over HTTPS enabled, that FQDN becomes the CN of the generated certificate, while `Internal service FQDN` and `localhost` remain in SAN. If the machine already has an old generated WAC certificate with unsuitable names, it is not reused.
-The repair flow also adds the generated self-signed certificate to `LocalMachine\Root`, because some internal WAC/.NET TLS calls can still reject an untrusted chain even when the gateway itself is running. This trust anchor remains in the store after WAC uninstall until you remove the certificate manually.
+Recovery checks the thumbprints in the marker, both WAC settings, the HTTP.SYS binding, and the WinRM HTTPS listener if the wrapper configured it. With seven days or less left, it rotates the certificate, restarts the gateway, and verifies the new thumbprint over TLS for the gateway names, including `localhost`. A failed probe restores the previous bindings. The previous certificate stays in the store.
 
+Installation or recovery of a wrapper-managed certificate registers the daily `WacClientCertificateRenewal` task. The task can start and finish on battery power. A missed run starts when possible. To trust the new certificate on the gateway PC, add `-TrustSelfSignedCertificate` to the recovery command. Remote clients that trust the individual self-signed certificate must trust the new thumbprint after rotation. Use `Get-ScheduledTaskInfo` to check the last run.
 
+```powershell
+Get-ScheduledTaskInfo -TaskName WacClientCertificateRenewal
+```
 
+**Operator-managed certificate.** Install the replacement certificate and its private key in `Cert:\LocalMachine\My`. The gateway must trust its chain. Replace `<THUMBPRINT>` with the new certificate's 40-digit hexadecimal thumbprint and reinstall WAC while preserving its data.
 
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData -CertificateThumbprint '<THUMBPRINT>'
+```
 
+Setup checks the replacement certificate and its chain before it stops the WAC services. If validation fails, the current installation keeps running.
 
+**Valid certificate, Schannel error `0x8009030D`.** If `NETWORK SERVICE` lost read access to the private key, reinstall during a maintenance window. Use the same WAC installer version and keep the existing data. Setup stops the WAC services and grants `NETWORK SERVICE` (`S-1-5-20`) read access to the selected certificate’s key file.
 
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wac-setup-engine.ps1 -KeepExistingData -InstallerPath C:\Temp\WindowsAdminCenter.exe
+```
 
+If the setup log in `C:\WAC-Diag` reports `No certificate private key ACL was changed`, check the key permissions with the certificate provider. Verify HTTPS after the repair.
+
+**Verify the gateway.** Run both checks on the gateway PC. The commands read the port from the protected marker. If the file is missing or the port is unspecified, they use the default port `6600`. Malformed JSON or a nonnumeric port stops the check with an error. If a legacy installation uses a custom port, replace `6600` with that port. The HTTPS check requires the client to trust the certificate chain and the certificate to cover the requested name. If the certificate covers a different gateway name, use that name in the URL.
+
+```powershell
+& {
+  $ErrorActionPreference = 'Stop'
+  $markerPath = Join-Path $env:ProgramFiles 'WacClientCertificateMaintenance\wac-setup.json'
+  $gatewayPort = 6600
+  if (Test-Path -LiteralPath $markerPath -ErrorAction Stop) {
+    $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $port = $marker.PSObject.Properties['port']
+    if ($port -and -not [string]::IsNullOrWhiteSpace($port.Value)) {
+      $gatewayPort = [int]$port.Value
+    }
+  }
+  Test-NetConnection -ComputerName localhost -Port $gatewayPort -InformationLevel Quiet
+  curl.exe --head "https://localhost:$gatewayPort/"
+}
+```
+
+A `True` result from `Test-NetConnection` confirms that a TCP listener accepted the connection. The HTTPS check verifies the gateway certificate and returns the HTTP response headers.
+
+For a legacy marker, the wrapper checks the recorded thumbprint and certificate identity in `LocalMachine\My`. It keeps a certificate of unknown origin pinned. If setup cannot read the marker or its `installedBy` field identifies another package, setup exits before stopping WAC services or removing installation directories. The wizard shows the marker path before requesting administrator access. Check the data directory, the package that owns the installation, and read access to the file.
