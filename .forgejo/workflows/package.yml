@@ -109,3 +109,22 @@ jobs:
           version: ${{ needs.verify.outputs.version }}
           source_commit: ${{ github.sha }}
           receipt_path: test-results/generic-package/checksum.json
+      - name: Check out the shared release action
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: nos1609/fj-actions-common
+          ref: 4c4364a36ff0f8f9e5b716d07b7acbe29b6f7c45
+          path: .ci-release
+          persist-credentials: false
+      - name: Attach the verified distribution to the Forgejo release
+        uses: ./.ci-release/actions/forgejo-release-assets
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        with:
+          tag: ${{ github.ref_name }}
+          source_commit: ${{ github.sha }}
+          assets: |
+            [
+              {"path":"dist/wac-client-windows-setup.zip","sha256":"${{ needs.build.outputs.zip_sha256 }}"},
+              {"path":"dist/wac-client-windows-setup.zip.sha256","sha256":"${{ needs.build.outputs.sum_sha256 }}"}
+            ]
