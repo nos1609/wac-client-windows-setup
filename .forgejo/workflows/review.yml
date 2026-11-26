@@ -37,7 +37,7 @@ jobs:
 
   portable:
     needs: prepare
-    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@17bb802ee8b39caf95630459073ddcbb286d9d90
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@51eeddc3382f952caa6c4758f52f8cef6498fd9d
     with:
       base_commit: ${{ inputs.base_commit }}
       head_commit: ${{ inputs.expected_head_sha }}
@@ -45,7 +45,7 @@ jobs:
 
   review:
     needs: portable
-    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@17bb802ee8b39caf95630459073ddcbb286d9d90
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@51eeddc3382f952caa6c4758f52f8cef6498fd9d
     with:
       base_commit: ${{ inputs.base_commit }}
       expected_head_sha: ${{ inputs.expected_head_sha }}

@@ -34,7 +34,7 @@ The project uses SemVer in the `VERSION` file without a leading `v`; release git
 
 ## Verify a candidate across two repositories
 
-Develop in private Forgejo. Push the candidate to a branch with the `feature/` prefix. The workflow calls a SHA-pinned `fj-actions-common/pester-ci`, checks the commit range, runs the portable tests, and checks the ZIP contents and SHA256. For a manual run, supply the full ancestor SHA in `base_commit`. The runner must provide Bash, Node, pwsh 7.6+, and Pester 6.2+ as required by the common workflow.
+Develop in private Forgejo. Push the candidate to a branch with the `feature/` prefix. The workflow calls a SHA-pinned `fj-actions-common/pester-ci`, checks the commit range, runs the portable tests, and checks the ZIP contents and SHA256. For a manual run, supply the full ancestor SHA in `base_commit`. The runner must provide Bash, Node, pwsh 7.7+, and Pester 6.2+ as required by the common workflow.
 
 Each push to a private `feature/**` branch or to `main` runs the shared `coderabbit-review.yml` after Pester passes. CodeRabbit reviews the full diff from the merge base with `main` for a feature branch and the pushed range for `main`. Each review uses CodeRabbit quota. A successful review requires a `clean` result. Reviews for the same branch share a queue. A manual run of `ci.yml` runs only the portable checks. For a manual review, dispatch `review.yml` with full SHAs in `base_commit` and `expected_head_sha`.
 

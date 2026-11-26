@@ -20,6 +20,14 @@ Describe 'WAC certificate maintenance' {
     foreach ($fn in $functions) { . ([scriptblock]::Create($fn.Extent.Text)) }
   }
 
+  It 'validates conflicting arguments during preview before elevation or log creation' {
+    $engine = Join-Path $root 'wac-setup-engine.ps1'
+    $logPath = Join-Path $TestDrive 'preview/setup.log'
+    Assert-FailsWith { & $engine -WhatIf -GenerateCertificate -CertificateThumbprint ('A'*40) -LogPath $logPath } 'Conflicting certificate'
+    & $engine -WhatIf -RenewCertificate -LogPath $logPath
+    (Test-Path -LiteralPath (Split-Path $logPath)) | Should -Be $false
+  }
+
   It 'rejects an expired supplied certificate before accessing its private key' {
     $cert = [pscustomobject]@{ Thumbprint=('A'*40); NotBefore=(Get-Date).AddDays(-61); NotAfter=(Get-Date).AddDays(-1) }
     Assert-FailsWith { Assert-SuppliedCertificateUsableForWac $cert } 'outside its validity period'
@@ -576,6 +584,29 @@ Describe 'WAC certificate maintenance' {
       $boundHash | Should -Be $oldHash
       (Get-Content -LiteralPath $markerPathTest -Raw | ConvertFrom-Json).certificateThumbprint | Should -Be $oldHash
       $restarts | Should -Be 2
+      (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $false
+    }
+    It 'keeps the journal when rollback fails' {
+      Mock Assert-WacServedCertificate { throw 'TLS probe failed' }
+      Mock Set-WacHttpBindingHash {
+        if ($Hash -eq $oldHash) { throw 'HTTP rollback failed' }
+        $script:boundHash = $Hash
+      }
+      Assert-FailsWith { Invoke-WacCertificateRotation $state } 'HTTP rollback failed'
+      $journal = Get-Content -LiteralPath (Join-Path $safeDir 'rotation.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+      $journal.old | Should -Be $oldHash
+      $journal.next | Should -Be $newHash
+    }
+    It 'keeps the journal when rollback restores a partially switched gateway' {
+      $journalPath = Join-Path $safeDir 'rotation.json'
+      Write-WacJsonAtomic $journalPath @{old=$oldHash; next=$newHash}
+      $script:boundHash = $newHash
+      Mock Get-Item { [pscustomobject]@{Thumbprint=$newHash; Subject='CN=WACTest'} } -ParameterFilter { $LiteralPath -like "Cert:*$newHash" }
+      Mock Test-ReusableGeneratedCertificate { $true }
+      Mock Assert-WacServedCertificate { throw 'TLS probe failed' }
+      Assert-FailsWith { Invoke-WacCertificateRotation $state } 'TLS probe failed'
+      $boundHash | Should -Be $newHash
+      (Test-Path -LiteralPath $journalPath) | Should -Be $true
     }
     It 'refuses to overwrite a foreign HTTP binding' {
       $script:boundHash = 'C' * 40

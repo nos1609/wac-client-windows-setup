@@ -306,6 +306,9 @@ function Wait-IfRequested {
   }
 }
 
+if (($GenerateCertificate -and $CertificateThumbprint) -or (($RenewCertificate -or $ScheduledRenewal) -and ($Uninstall -or $GenerateCertificate -or $CertificateThumbprint -or $RefreshInstaller))) {
+  throw 'Conflicting certificate, uninstall, or upgrade options.'
+}
 if ($WhatIfPreference) {
   Write-Host 'Preview only. No WAC installation or maintenance operations will run.'
   return
@@ -1678,13 +1681,6 @@ $setupLock = $null
 try {
   Assert-Admin
 
-  if (($GenerateCertificate -and $CertificateThumbprint) -or (($RenewCertificate -or $ScheduledRenewal) -and ($Uninstall -or $GenerateCertificate -or $CertificateThumbprint -or $RefreshInstaller))) {
-    throw 'Conflicting certificate, uninstall, or upgrade options.'
-  }
-  if ($WhatIfPreference) {
-    [void]$PSCmdlet.ShouldProcess($DataDir, 'Apply the requested Windows Admin Center operation')
-    return
-  }
   $setupLock = Enter-WacMaintenanceLock
   if ($ScheduledRenewal) {
     if ($PSCmdlet.ShouldProcess('Windows Admin Center', 'Check scheduled certificate renewal')) {
