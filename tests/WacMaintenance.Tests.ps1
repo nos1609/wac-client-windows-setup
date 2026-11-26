@@ -46,6 +46,16 @@ Describe 'WAC certificate maintenance' {
       } finally { $cert.Dispose(); $rsa.Dispose() }
     }
 
+    It 'reads UTF-8 marker and appsettings paths when the shell defaults to another encoding' {
+      $PSDefaultParameterValues = @{'Get-Content:Encoding' = 'ASCII'}
+      $label = -join ([char[]](0x041F,0x0443,0x0442,0x044C))
+      $path = Join-Path $TestDrive 'utf8.json'
+      Mock Assert-WacLocalPath {}
+      Write-WacJsonAtomic $path @{installedBy='wac-client-windows-setup'; dataDir=$label}
+      (Read-WacSetupMarker -Path $path).dataDir | Should -BeExactly $label
+      (Read-WacAppSettingsJson -AppSettingsPath $path).dataDir | Should -BeExactly $label
+    }
+
     It 'prefers the protected marker after migrating legacy state' {
       $data = Join-Path $TestDrive 'old-data'
       $safe = Join-Path $TestDrive 'protected'
@@ -310,12 +320,54 @@ Describe 'WAC certificate maintenance' {
   }
 
   Context 'Upgrade directory fixtures' {
+    It 'preserves data for this install and persists the chosen default (<case>)' -TestCases @(
+      @{case='refresh existing data'; refresh=$true; existing=$true; marked=$false; keep=$false; preserve=$true}
+      @{case='refresh with marker'; refresh=$true; existing=$false; marked=$true; keep=$false; preserve=$true}
+      @{case='fresh install via refresh'; refresh=$true; existing=$false; marked=$false; keep=$false; preserve=$false}
+      @{case='explicit keep'; refresh=$false; existing=$true; marked=$false; keep=$true; preserve=$true}
+      @{case='ordinary reinstall'; refresh=$false; existing=$true; marked=$true; keep=$false; preserve=$false}
+    ) {
+      param($case, $refresh, $existing, $marked, $keep, $preserve)
+      $work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+      $DataDir = Join-Path $work 'data'
+      $InstallDir = Join-Path $work 'program'
+      $RefreshInstaller = $refresh
+      $KeepExistingData = $keep
+      $marker = if ($marked) { [pscustomobject]@{keepExistingData=$keep} }
+      $app = Join-Path $work 'app'
+      $payload = Join-Path $work 'payload-data'
+      $template = Join-Path $app 'Service/appsettings.json'
+      $uxFile = Join-Path $payload 'UX/index.html'
+      $null = New-Item -ItemType Directory -Path (Split-Path $template),(Split-Path $uxFile) -Force
+      [IO.File]::WriteAllText($template, '{}')
+      [IO.File]::WriteAllText($uxFile, 'updated')
+      [IO.File]::WriteAllText((Join-Path $payload 'seed.txt'), 'seed')
+      $connection = Join-Path $DataDir 'connection.txt'
+      if ($existing) {
+        $null = New-Item -ItemType Directory -Path $DataDir
+        [IO.File]::WriteAllText($connection, 'saved')
+      }
+      $markerPath = Join-Path $work 'protected-marker.json'
+      Mock Assert-WacLocalPath {}
+      Mock Set-WacDirectorySecurity {}
+      Mock Assert-WacCodeAccess {}
+      Mock Get-WacProtectedMarkerPath { $markerPath }
+      Mock Grant-WacMarkerReadAccess {}
+      Mock Write-Log {}
+
+      Install-WacPayload -PayloadApp $app -PayloadData $payload -AdminTemplate $template -SetupMarker $marker
+      Write-WacSetupMarker
+      (Read-WacSetupMarker -Path $markerPath).keepExistingData | Should -Be $keep
+      (Test-Path -LiteralPath $connection) | Should -Be ($existing -and $preserve)
+      (Test-Path -LiteralPath (Join-Path $DataDir 'seed.txt')) | Should -Be (-not $preserve)
+      [IO.File]::ReadAllText((Join-Path $DataDir 'UX/index.html')) | Should -Be 'updated'
+    }
+
     It 'rebuilds legacy code trees while preserving the database on upgrade' {
       $InstallDir = Join-Path $TestDrive 'program'
       $DataDir = Join-Path $TestDrive 'data'
       $updater = Join-Path $DataDir 'Updater'
       $database = Join-Path $DataDir 'Database'
-      $KeepExistingData = $true
       $null = New-Item -ItemType Directory -Path $updater,$database,$InstallDir -Force
       foreach ($dir in @($updater,$InstallDir)) { [IO.File]::WriteAllText((Join-Path $dir 'old.dll'),'obsolete') }
       $saved = Join-Path $database 'saved.txt'
@@ -323,7 +375,7 @@ Describe 'WAC certificate maintenance' {
       Mock Assert-WacLocalPath {}
       Mock Set-WacDirectorySecurity {}
       Mock Assert-WacCodeAccess {}
-      Initialize-WacInstallationDirectories
+      Initialize-WacInstallationDirectories -PreserveData $true
       [IO.File]::ReadAllText($saved) | Should -Be 'saved connection'
       foreach ($dir in @($updater,$InstallDir)) {
         (Test-Path -LiteralPath $dir -PathType Container) | Should -Be $true
@@ -336,7 +388,6 @@ Describe 'WAC certificate maintenance' {
     -not ([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $InstallDir = Join-Path $TestDrive 'acl-program'
     $DataDir = Join-Path $TestDrive 'acl-data'
-    $KeepExistingData = $true
     $ns = [Security.Principal.SecurityIdentifier]::new('S-1-5-20')
     $db = Join-Path $DataDir 'Database'
     $updater = Join-Path $DataDir 'Updater'
@@ -347,7 +398,7 @@ Describe 'WAC certificate maintenance' {
     $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($ns, 'Modify', 'Allow'))
     Set-Acl -LiteralPath $old -AclObject $fileAcl
     Assert-FailsWith { Assert-WacCodeAccess $old } 'Unsafe access'
-    Initialize-WacInstallationDirectories
+    Initialize-WacInstallationDirectories -PreserveData $true
     (Test-Path -LiteralPath $old) | Should -Be $false
     foreach ($codeDir in @($InstallDir,$updater)) {
       $exe = Join-Path $codeDir 'probe.exe'
@@ -465,9 +516,10 @@ Describe 'WAC certificate maintenance' {
       Write-WacJsonAtomic $markerPathTest $state
       $block = @{ Subject='WACTest'; Thumbprint=$oldHash }
       $script:confPathTest = Join-Path $svcDir 'appsettings.json'
+      $script:settingValue = 'setting-' + [char]0x0416
       Write-WacJsonAtomic $confPathTest @{
         Kestrel=@{Endpoints=@{WindowsAdminCenter=@{Certificate=$block}}}
-        WindowsAdminCenter=@{ServiceCertificate=$block}; preserve='unrelated setting'
+        WindowsAdminCenter=@{ServiceCertificate=$block}; preserve=$settingValue
       }
       Mock Assert-WacLocalPath {}
       Mock Get-WacMaintenanceDirectory { $script:safeDir }
@@ -490,14 +542,14 @@ Describe 'WAC certificate maintenance' {
     }
     It 'rotates a v1 installation, verifies the new endpoint and persists both bindings' {
       Invoke-WacCertificateRotation $state
-      $conf = Get-Content -LiteralPath $confPathTest -Raw | ConvertFrom-Json
+      $conf = Get-Content -LiteralPath $confPathTest -Encoding UTF8 -Raw | ConvertFrom-Json
       $marker = Get-Content -LiteralPath (Get-WacProtectedMarkerPath) -Raw | ConvertFrom-Json
       $marker.certificateSource | Should -Be 'Generated'
       $marker.certificateThumbprint | Should -Be $newHash
       $marker.productVersion | Should -Be '2.6.6.18'
       $conf.Kestrel.Endpoints.WindowsAdminCenter.Certificate.Thumbprint | Should -Be $newHash
       $conf.WindowsAdminCenter.ServiceCertificate.Thumbprint | Should -Be $newHash
-      $conf.preserve | Should -Be 'unrelated setting'
+      $conf.preserve | Should -BeExactly $settingValue
       $boundHash | Should -Be $newHash
       ($probes -contains $newHash) | Should -Be $true
       ($probes -contains 'localhost') | Should -Be $true
@@ -514,11 +566,13 @@ Describe 'WAC certificate maintenance' {
       $restarts | Should -Be 1
     }
     It 'restores the previous bindings when TLS verification fails' {
+      $PSDefaultParameterValues = @{'Get-Content:Encoding' = 'ASCII'}
       Mock Assert-WacServedCertificate { throw 'TLS probe failed' }
       Assert-FailsWith { Invoke-WacCertificateRotation $state } 'TLS probe failed'
-      $conf = Get-Content -LiteralPath $confPathTest -Raw | ConvertFrom-Json
+      $conf = Get-Content -LiteralPath $confPathTest -Encoding UTF8 -Raw | ConvertFrom-Json
       $conf.Kestrel.Endpoints.WindowsAdminCenter.Certificate.Thumbprint | Should -Be $oldHash
       $conf.WindowsAdminCenter.ServiceCertificate.Thumbprint | Should -Be $oldHash
+      $conf.preserve | Should -BeExactly $settingValue
       $boundHash | Should -Be $oldHash
       (Get-Content -LiteralPath $markerPathTest -Raw | ConvertFrom-Json).certificateThumbprint | Should -Be $oldHash
       $restarts | Should -Be 2

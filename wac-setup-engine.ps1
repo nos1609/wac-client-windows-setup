@@ -645,7 +645,7 @@ function Read-WacAppSettingsJson {
   param([Parameter(Mandatory = $true)][string]$AppSettingsPath)
 
   try {
-    return (Get-Content -LiteralPath $AppSettingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+    return (Get-Content -LiteralPath $AppSettingsPath -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
   } catch {
     throw "WAC appsettings.json is missing or invalid. Payload extraction may be incomplete or corrupt: $AppSettingsPath. $($_.Exception.Message)"
   }
@@ -842,8 +842,10 @@ function Set-WacDirectorySecurity {
 }
 
 function Initialize-WacInstallationDirectories {
+  param([Parameter(Mandatory = $true)][bool]$PreserveData)
+
   $updater = Join-Path $DataDir 'Updater'
-  if (-not $KeepExistingData -and [IO.Directory]::Exists($DataDir)) {
+  if (-not $PreserveData -and [IO.Directory]::Exists($DataDir)) {
     Assert-WacLocalPath $DataDir
     [IO.Directory]::Delete($DataDir, $true)
   }
@@ -867,6 +869,25 @@ function Initialize-WacInstallationDirectories {
   Set-WacDirectorySecurity -Path $DataDir -Data
   Assert-WacCodeAccess -Path $DataDir -Ancestor
   Assert-WacCodeAccess -Path $updater
+}
+
+function Install-WacPayload {
+  param(
+    [Parameter(Mandatory = $true)][string]$PayloadApp,
+    [Parameter(Mandatory = $true)][string]$PayloadData,
+    [Parameter(Mandatory = $true)][string]$AdminTemplate,
+    $SetupMarker
+  )
+
+  $preserveData = $KeepExistingData -or ($RefreshInstaller -and ($SetupMarker -or (Test-Path -LiteralPath $DataDir)))
+  Initialize-WacInstallationDirectories -PreserveData $preserveData
+  Copy-DirectoryContents -Source $PayloadApp -Destination $InstallDir -Exclude 'Enterprise'
+  Copy-Item -LiteralPath $AdminTemplate -Destination (Join-Path $InstallDir 'Service\appsettings.json') -Force
+  if ((-not $preserveData) -and (Test-Path -LiteralPath $PayloadData)) {
+    Copy-DirectoryContents -Source $PayloadData -Destination $DataDir -Exclude 'Updater'
+  } elseif ($preserveData -and (Test-Path -LiteralPath (Join-Path $PayloadData 'UX'))) {
+    Copy-DirectoryContents -Source (Join-Path $PayloadData 'UX') -Destination (Join-Path $DataDir 'UX')
+  }
 }
 
 function Assert-WacExecutableTree {
@@ -1710,7 +1731,6 @@ try {
     if (-not $setupMarker -and (Get-Service -Name $script:ServiceName -ErrorAction SilentlyContinue)) {
       throw 'Cannot upgrade a running installation without its wrapper marker. Check -DataDir.'
     }
-    if ($setupMarker -or (Test-Path -LiteralPath $DataDir)) { $KeepExistingData = $true }
     $freshDir = Join-Path (Get-InstallerDownloadDirectory) ([guid]::NewGuid().ToString('N'))
     $InstallerPath = Save-WacInstallerFromAkaMs -DownloadDir $freshDir
     if (-not $InstallerPath) { throw 'A fresh Microsoft installer could not be downloaded.' }
@@ -1785,14 +1805,7 @@ try {
     Remove-HttpSysBinding -BindingPort $Port
 
     Write-Log "Copying files" "STEP"
-    Initialize-WacInstallationDirectories
-    Copy-DirectoryContents -Source $payloadApp -Destination $InstallDir -Exclude 'Enterprise'
-    Copy-Item -LiteralPath $adminTemplate -Destination (Join-Path $InstallDir 'Service\appsettings.json') -Force
-    if ((-not $KeepExistingData) -and (Test-Path -LiteralPath $payloadData)) {
-      Copy-DirectoryContents -Source $payloadData -Destination $DataDir -Exclude 'Updater'
-    } elseif ($KeepExistingData -and (Test-Path -LiteralPath (Join-Path $payloadData 'UX'))) {
-      Copy-DirectoryContents -Source (Join-Path $payloadData 'UX') -Destination (Join-Path $DataDir 'UX')
-    }
+    Install-WacPayload -PayloadApp $payloadApp -PayloadData $payloadData -AdminTemplate $adminTemplate -SetupMarker $setupMarker
     New-Item -ItemType Directory -Path (Join-Path $DataDir "Logs"), (Join-Path $DataDir "Database") -Force | Out-Null
     $configLog = Join-Path $DataDir 'Logs\Configuration.log'
     if (-not (Test-Path -LiteralPath $configLog)) { New-Item -ItemType File -Path $configLog -ErrorAction Stop | Out-Null }

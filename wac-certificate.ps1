@@ -51,7 +51,7 @@ function Read-WacSetupMarker {
   try {
     if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) { return $null }
     Assert-WacLocalPath $Path
-    $marker = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $marker = Get-Content -LiteralPath $Path -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     if ($marker.installedBy -ne "wac-client-windows-setup") { throw 'Unexpected setup marker identity.' }
     return $marker
   } catch {
@@ -301,7 +301,7 @@ function Invoke-WacManualRenewal {
   $dir = Get-WacMaintenanceDirectory
   $statePath = Join-Path $dir 'settings.json'
   if (Test-Path -LiteralPath $statePath) {
-    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state = Get-Content -LiteralPath $statePath -Encoding UTF8 -Raw | ConvertFrom-Json
     if ($state.dataDir -ne $Marker.dataDir) { throw 'Existing renewal state belongs to a different installation.' }
   } else { $state = $Marker }
   if ($script:OriginalBoundParameters.ContainsKey('TrustSelfSignedCertificate')) {
@@ -312,7 +312,7 @@ function Invoke-WacManualRenewal {
 }
 
 function Invoke-WacScheduledRenewal {
-  $state = Get-Content -LiteralPath (Join-Path (Get-WacMaintenanceDirectory) 'settings.json') -Raw | ConvertFrom-Json
+  $state = Get-Content -LiteralPath (Join-Path (Get-WacMaintenanceDirectory) 'settings.json') -Encoding UTF8 -Raw | ConvertFrom-Json
   Invoke-WacLockedCertificateRotation -State $state
 }
 
@@ -338,7 +338,7 @@ function Invoke-WacCertificateRotation {
   if (-not $svc -or $svc.PathName.Trim('"') -ne (Join-Path $State.installDir 'Service\WindowsAdminCenter.exe')) {
     throw 'Renewal state does not match the installed gateway service.'
   }
-  $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+  $marker = Get-Content -LiteralPath $markerPath -Encoding UTF8 -Raw | ConvertFrom-Json
   if ($marker.dataDir -ne $State.dataDir -or $marker.installDir -ne $State.installDir) {
     throw 'The WAC marker directories do not match the renewal state.'
   }
@@ -350,7 +350,7 @@ function Invoke-WacCertificateRotation {
   $pendingPath = Join-Path $dir 'rotation.json'
   $pending = $null
   if (Test-Path -LiteralPath $pendingPath) {
-    $pending = Get-Content -LiteralPath $pendingPath -Raw | ConvertFrom-Json
+    $pending = Get-Content -LiteralPath $pendingPath -Encoding UTF8 -Raw | ConvertFrom-Json
     if ($pending.old -ne $old -and $pending.next -ne $old) { throw 'Renewal journal belongs to a different certificate.' }
     if ($pending.next -notmatch '^[0-9a-f]{40}$') { throw 'Invalid renewal journal.' }
   }
@@ -400,7 +400,7 @@ function Invoke-WacCertificateRotation {
     Write-WacJsonAtomic $pendingPath $pending
   }
   # The journal pins both ends. An interrupted run can finish from either binding.
-  $previousJson = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+  $previousJson = Get-Content -LiteralPath $settingsPath -Encoding UTF8 -Raw | ConvertFrom-Json
   $previousWinRm = if ($wsPath) { (Get-Item -LiteralPath $wsPath).Value }
   $configChanged = $false
   $wsChanged = $false
