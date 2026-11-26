@@ -74,22 +74,36 @@ jobs:
             refs/heads/main) base=$PUSH_BASE ;;
             *) exit 1 ;;
           esac
-          [[ "$base" =~ ^[0-9a-f]{40}$ && "$base" != "$HEAD_SHA" ]]
           printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
 
   portable:
     needs: prepare
-    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@d96ce5c17d93fda23e3c9e4962b37d352bcb4028
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@8729acfd577841c77c09de71ef0b081e6a4b6f18
     with:
       base_commit: ${{ needs.prepare.outputs.base }}
       head_commit: ${{ needs.prepare.outputs.head }}
       script_path: scripts/test-portable.ps1
       runs_on: self-hosted
 
-  review:
+  # Forgejo evaluates caller conditions inside reusable jobs. Select push events here.
+  review_inputs:
+    needs: prepare
     if: ${{ github.event_name == 'push' && github.event.repository.private }}
-    needs: [prepare, portable]
-    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@d96ce5c17d93fda23e3c9e4962b37d352bcb4028
+    runs-on: ${{ vars.COMMON_LIGHT_RUNNER || 'self-hosted' }}
+    steps:
+      - name: Check the review range before calling CodeRabbit
+        shell: bash
+        env:
+          BASE: ${{ needs.prepare.outputs.review_base }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASE" != "$HEAD_SHA" && "$HEAD_SHA" == "$GITHUB_SHA" ]]
+
+  review:
+    needs: [prepare, portable, review_inputs]
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@8729acfd577841c77c09de71ef0b081e6a4b6f18
     with:
       base_commit: ${{ needs.prepare.outputs.review_base }}
       expected_head_sha: ${{ needs.prepare.outputs.head }}
@@ -98,3 +112,12 @@ jobs:
       rate_limit_max_wait_seconds: "1980"
       process_timeout_seconds: "2400"
       upload_prompts: true
+
+  review_policy:
+    needs: [prepare, review_inputs, review]
+    uses: nos1609/fj-actions-common/.forgejo/workflows/review-policy.yml@8729acfd577841c77c09de71ef0b081e6a4b6f18
+    with:
+      expected_head_sha: ${{ needs.prepare.outputs.head }}
+      base_commit: ${{ needs.prepare.outputs.review_base }}
+      source_task_id: ${{ needs.review.outputs.task_id }}
+      source_workflow_id: ci.yml

@@ -37,7 +37,7 @@ jobs:
 
   portable:
     needs: prepare
-    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@d96ce5c17d93fda23e3c9e4962b37d352bcb4028
+    uses: nos1609/fj-actions-common/.forgejo/workflows/pester-ci.yml@8729acfd577841c77c09de71ef0b081e6a4b6f18
     with:
       base_commit: ${{ inputs.base_commit }}
       head_commit: ${{ inputs.expected_head_sha }}
@@ -45,7 +45,7 @@ jobs:
 
   review:
     needs: portable
-    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@d96ce5c17d93fda23e3c9e4962b37d352bcb4028
+    uses: nos1609/fj-actions-common/.forgejo/workflows/coderabbit-review.yml@8729acfd577841c77c09de71ef0b081e6a4b6f18
     with:
       base_commit: ${{ inputs.base_commit }}
       expected_head_sha: ${{ inputs.expected_head_sha }}
@@ -54,3 +54,12 @@ jobs:
       rate_limit_max_wait_seconds: "1980"
       process_timeout_seconds: "2400"
       upload_prompts: true
+
+  review_policy:
+    needs: [review]
+    uses: nos1609/fj-actions-common/.forgejo/workflows/review-policy.yml@8729acfd577841c77c09de71ef0b081e6a4b6f18
+    with:
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      base_commit: ${{ inputs.base_commit }}
+      source_task_id: ${{ needs.review.outputs.task_id }}
+      source_workflow_id: review.yml
