@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   package:
+    if: github.server_url == 'https://github.com'
     name: Build release package
     runs-on: windows-latest
     timeout-minutes: 20
