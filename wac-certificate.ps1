@@ -360,17 +360,21 @@ function Invoke-WacCertificateRotation {
   $gateway = $json.Kestrel.Endpoints.WindowsAdminCenter.Certificate
   $service = $json.WindowsAdminCenter.ServiceCertificate
   $httpHash = Get-WacHttpBindingHash $port
-  foreach ($bound in @($gateway.Thumbprint, $service.Thumbprint, $marker.certificateThumbprint, $httpHash)) {
+  $previousBindings = @($gateway.Thumbprint, $service.Thumbprint, $marker.certificateThumbprint, $httpHash)
+  foreach ($bound in $previousBindings) {
     if ($bound -notin $allowed) { throw 'The certificate binding changed outside the wrapper. Review the live gateway before retrying.' }
   }
   $wsPath = $null
+  $previousWinRm = $null
   if ($WinRmHttpsMode -eq 'Enable' -and -not (Get-WacMarkerValue $State 'skipPsRemoting')) {
     $listener = @(Get-ChildItem WSMan:\localhost\Listener | Where-Object {
       $_.Keys -contains 'Transport=HTTPS' -and $_.Keys -contains 'Address=*'
     })
     if ($listener.Count -ne 1) { throw 'Cannot identify the existing WinRM HTTPS listener.' }
     $wsPath = Join-Path $listener[0].PSPath 'CertificateThumbprint'
-    if ((Get-Item -LiteralPath $wsPath).Value -notin $allowed) { throw 'WinRM uses a different certificate.' }
+    $previousWinRm = (Get-Item -LiteralPath $wsPath -ErrorAction Stop).Value
+    if ($previousWinRm -notin $allowed) { throw 'WinRM uses a different certificate.' }
+    $previousBindings += $previousWinRm
   }
 
   $current = Get-Item -LiteralPath "Cert:\LocalMachine\My\$old" -ErrorAction SilentlyContinue
@@ -401,7 +405,6 @@ function Invoke-WacCertificateRotation {
   }
   # The journal pins both ends. An interrupted run can finish from either binding.
   $previousJson = Get-Content -LiteralPath $settingsPath -Encoding UTF8 -Raw | ConvertFrom-Json
-  $previousWinRm = if ($wsPath) { (Get-Item -LiteralPath $wsPath).Value }
   $configChanged = $false
   $wsChanged = $false
   $httpChanged = $false
@@ -416,17 +419,28 @@ function Invoke-WacCertificateRotation {
       $httpChanged = $true
       Set-WacHttpBindingHash $port $next.Thumbprint
     }
-    if ($wsPath -and $previousWinRm -ne $next.Thumbprint) {
-      $wsChanged = $true
-      Set-Item -LiteralPath $wsPath -Value $next.Thumbprint -Force
+    if ($wsPath) {
+      $liveWinRm = (Get-Item -LiteralPath $wsPath -ErrorAction Stop).Value
+      if ($liveWinRm -ne $previousWinRm) { throw 'WinRM listener changed during certificate rotation.' }
+      if ($liveWinRm -ne $next.Thumbprint) {
+        $wsChanged = $true
+        Set-Item -LiteralPath $wsPath -Value $next.Thumbprint -Force -ErrorAction Stop
+      }
     }
     Restart-Service -Name WindowsAdminCenter -ErrorAction Stop
     Assert-WacServedCertificate $next $names $port -AllowUntrustedRoot:(!$trust)
   } catch {
     $failure = $_
     $recoveryErrors = @()
-    if ($wsChanged) {
-      try { Set-Item -LiteralPath $wsPath -Value $previousWinRm -Force } catch { $recoveryErrors += $_.Exception.Message }
+    if ($wsPath) {
+      try {
+        $liveWinRm = (Get-Item -LiteralPath $wsPath -ErrorAction Stop).Value
+        if ($wsChanged -and $liveWinRm -eq $next.Thumbprint) {
+          Set-Item -LiteralPath $wsPath -Value $previousWinRm -Force -ErrorAction Stop
+        } elseif ($liveWinRm -ne $previousWinRm) {
+          throw 'WinRM listener changed outside the rotation. Review its certificate before retrying.'
+        }
+      } catch { $recoveryErrors += $_.Exception.Message }
     }
     if ($httpChanged) {
       try { Set-WacHttpBindingHash $port $httpHash } catch { $recoveryErrors += $_.Exception.Message }
@@ -436,6 +450,10 @@ function Invoke-WacCertificateRotation {
         Write-WacJsonAtomic $settingsPath $previousJson
         Restart-Service -Name WindowsAdminCenter -ErrorAction Stop
       } catch { $recoveryErrors += $_.Exception.Message }
+    }
+    # An interrupted rotation can start with mixed bindings. It still needs the journal after rollback.
+    if ($recoveryErrors.Count -eq 0 -and -not ($previousBindings -ne $old)) {
+      try { Remove-Item -LiteralPath $pendingPath -Force -ErrorAction Stop } catch { $recoveryErrors += $_.Exception.Message }
     }
     if ($recoveryErrors.Count) { throw "$failure. Rollback needs attention: $($recoveryErrors -join ', ')" }
     throw $failure

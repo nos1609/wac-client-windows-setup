@@ -20,6 +20,14 @@ Describe 'WAC certificate maintenance' {
     foreach ($fn in $functions) { . ([scriptblock]::Create($fn.Extent.Text)) }
   }
 
+  It 'validates conflicting arguments during preview before elevation or log creation' {
+    $engine = Join-Path $root 'wac-setup-engine.ps1'
+    $logPath = Join-Path $TestDrive 'preview/setup.log'
+    Assert-FailsWith { & $engine -WhatIf -GenerateCertificate -CertificateThumbprint ('A'*40) -LogPath $logPath } 'Conflicting certificate'
+    & $engine -WhatIf -RenewCertificate -LogPath $logPath
+    (Test-Path -LiteralPath (Split-Path $logPath)) | Should -Be $false
+  }
+
   It 'rejects an expired supplied certificate before accessing its private key' {
     $cert = [pscustomobject]@{ Thumbprint=('A'*40); NotBefore=(Get-Date).AddDays(-61); NotAfter=(Get-Date).AddDays(-1) }
     Assert-FailsWith { Assert-SuppliedCertificateUsableForWac $cert } 'outside its validity period'
@@ -565,6 +573,45 @@ Describe 'WAC certificate maintenance' {
       $boundHash | Should -Be $newHash
       $restarts | Should -Be 1
     }
+    Context 'Managed WinRM listener' {
+      BeforeEach {
+        $state.winRmHttpsMode = 'Enable'
+        $script:listenerPath = Join-Path $fixture 'CertificateThumbprint'
+        $script:listenerHash = $oldHash
+        $script:listenerWrites = @()
+        Mock Get-ChildItem {
+          [pscustomobject]@{Keys=@('Transport=HTTPS','Address=*'); PSPath=$fixture}
+        } -ParameterFilter { $Path -like 'WSMan:*' }
+        Mock Get-Item { [pscustomobject]@{Value=$script:listenerHash} } -ParameterFilter { $LiteralPath -eq $script:listenerPath }
+        Mock Set-Item {
+          $script:listenerWrites += $Value
+          $script:listenerHash = $Value
+        } -ParameterFilter { $LiteralPath -eq $script:listenerPath }
+      }
+      It 'preserves a listener changed after the initial binding check' {
+        Mock Grant-CertificatePrivateKeyAcl { $script:listenerHash = 'C' * 40 }
+        Assert-FailsWith { Invoke-WacCertificateRotation $state } 'WinRM'
+        $listenerWrites.Count | Should -Be 0
+        $listenerHash | Should -Be ('C' * 40)
+        $boundHash | Should -Be $oldHash
+        (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $true
+      }
+      It 'preserves an external listener change during rollback' {
+        Mock Assert-WacServedCertificate { $script:listenerHash = 'C' * 40; throw 'TLS probe failed' }
+        Assert-FailsWith { Invoke-WacCertificateRotation $state } 'TLS probe failed'
+        $listenerWrites.Count | Should -Be 1
+        $listenerHash | Should -Be ('C' * 40)
+        $boundHash | Should -Be $oldHash
+        (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $true
+      }
+      It 'restores the listener changed by this rotation on a TLS failure' {
+        Mock Assert-WacServedCertificate { throw 'TLS probe failed' }
+        Assert-FailsWith { Invoke-WacCertificateRotation $state } 'TLS probe failed'
+        ($listenerWrites -join ',') | Should -Be "$newHash,$oldHash"
+        $listenerHash | Should -Be $oldHash
+        (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $false
+      }
+    }
     It 'restores the previous bindings when TLS verification fails' {
       $PSDefaultParameterValues = @{'Get-Content:Encoding' = 'ASCII'}
       Mock Assert-WacServedCertificate { throw 'TLS probe failed' }
@@ -576,6 +623,29 @@ Describe 'WAC certificate maintenance' {
       $boundHash | Should -Be $oldHash
       (Get-Content -LiteralPath $markerPathTest -Raw | ConvertFrom-Json).certificateThumbprint | Should -Be $oldHash
       $restarts | Should -Be 2
+      (Test-Path -LiteralPath (Join-Path $safeDir 'rotation.json')) | Should -Be $false
+    }
+    It 'keeps the journal when rollback fails' {
+      Mock Assert-WacServedCertificate { throw 'TLS probe failed' }
+      Mock Set-WacHttpBindingHash {
+        if ($Hash -eq $oldHash) { throw 'HTTP rollback failed' }
+        $script:boundHash = $Hash
+      }
+      Assert-FailsWith { Invoke-WacCertificateRotation $state } 'HTTP rollback failed'
+      $journal = Get-Content -LiteralPath (Join-Path $safeDir 'rotation.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+      $journal.old | Should -Be $oldHash
+      $journal.next | Should -Be $newHash
+    }
+    It 'keeps the journal when rollback restores a partially switched gateway' {
+      $journalPath = Join-Path $safeDir 'rotation.json'
+      Write-WacJsonAtomic $journalPath @{old=$oldHash; next=$newHash}
+      $script:boundHash = $newHash
+      Mock Get-Item { [pscustomobject]@{Thumbprint=$newHash; Subject='CN=WACTest'} } -ParameterFilter { $LiteralPath -like "Cert:*$newHash" }
+      Mock Test-ReusableGeneratedCertificate { $true }
+      Mock Assert-WacServedCertificate { throw 'TLS probe failed' }
+      Assert-FailsWith { Invoke-WacCertificateRotation $state } 'TLS probe failed'
+      $boundHash | Should -Be $newHash
+      (Test-Path -LiteralPath $journalPath) | Should -Be $true
     }
     It 'refuses to overwrite a foreign HTTP binding' {
       $script:boundHash = 'C' * 40
